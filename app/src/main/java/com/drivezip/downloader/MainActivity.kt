@@ -60,7 +60,7 @@ class MainActivity : ComponentActivity() {
         setContent {
             MaterialTheme {
                 Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-                    MilestoneSixScreen()
+                    MilestoneTenScreen()
                 }
             }
         }
@@ -182,14 +182,13 @@ data class ConvertedFileResult(
 )
 
 @Composable
-fun MilestoneSixScreen() {
+fun MilestoneTenScreen() {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val prefs = remember { getSecurePrefs(context) }
 
     var selectedTab by remember { mutableStateOf(0) }
 
-    // Applied vs Draft Settings
     var appliedGhRepo by remember { mutableStateOf(prefs.getString("gh_repo", "rudrarajkumar/drivezip-pro") ?: "rudrarajkumar/drivezip-pro") }
     var draftGhRepo by remember { mutableStateOf(appliedGhRepo) }
 
@@ -248,14 +247,47 @@ fun MilestoneSixScreen() {
     var zipDownloadStatus by remember { mutableStateOf("") }
     var savedLocalZipPath by remember { mutableStateOf("") }
 
+    suspend fun silentlyRefreshGoogleToken(): String? = withContext(Dispatchers.IO) {
+        if (signedInEmail.isBlank()) return@withContext null
+        try {
+            val acct = Account(signedInEmail, "com.google")
+            if (appliedOauthToken.isNotBlank()) {
+                try {
+                    GoogleAuthUtil.clearToken(context, appliedOauthToken)
+                } catch (_: Exception) {}
+            }
+            val fresh = GoogleAuthUtil.getToken(
+                context,
+                acct,
+                "oauth2:https://www.googleapis.com/auth/drive.readonly"
+            )
+            withContext(Dispatchers.Main) {
+                appliedOauthToken = fresh
+                draftOauthToken = fresh
+                prefs.edit().putString("oauth_token", fresh).apply()
+            }
+            fresh
+        } catch (_: Exception) {
+            null
+        }
+    }
+
     fun applyJobSnapshot(st: JSONObject) {
         activeJobId = st.optString("job_id", activeJobId)
         jobState = st.optString("state", "")
         jobCurrentFile = st.optString("current_file", "")
         jobProcessedFiles = st.optInt("processed_files", 0)
         jobTotalFiles = st.optInt("total_files", 1).coerceAtLeast(1)
-        val fallbackPct = (jobProcessedFiles.toFloat() / jobTotalFiles.toFloat()) * 100f
-        jobOverallPercent = st.optDouble("overall_percent", fallbackPct.toDouble()).toFloat().coerceIn(0f, 100f)
+
+        var pct = st.optDouble("overall_percent", -1.0).toFloat()
+        if (pct <= 0f) {
+            // Secondary fallback: parse percentage from Live Activity text if present
+            val m = Regex("(\\d+)%").find(jobCurrentFile)
+            val subPct = m?.groupValues?.get(1)?.toFloatOrNull() ?: 0f
+            pct = ((jobProcessedFiles.toFloat() + (subPct / 100f)) / jobTotalFiles.toFloat()) * 100f
+        }
+        jobOverallPercent = pct.coerceIn(0f, 100f)
+
         jobEstimatedTotalBytes = st.optLong("estimated_total_bytes", 0L)
         jobActualBytesSoFar = st.optLong("actual_bytes_so_far", 0L)
         zipReady = st.optBoolean("zip_ready", false)
@@ -292,22 +324,75 @@ fun MilestoneSixScreen() {
 
     suspend fun pollJobUntilDone(jobId: String) {
         isConverting = true
+        var lastTokenRefreshMs = System.currentTimeMillis()
         while (true) {
             val pollRes = pollConversionJobStatus(appliedBackendUrl, appliedBackendKey, jobId)
             if (pollRes.isSuccess) {
                 val st = pollRes.getOrThrow()
                 applyJobSnapshot(st)
-                if (jobState == "COMPLETED" || jobState == "FAILED") {
+
+                // Auto-refresh OAuth token every 25 minutes OR immediately if backend signals 401!
+                val needsRefresh = st.optBoolean("needs_token_refresh", false)
+                val elapsedMinutes = (System.currentTimeMillis() - lastTokenRefreshMs) / 60000L
+                if (needsRefresh || elapsedMinutes >= 25L) {
+                    lastTokenRefreshMs = System.currentTimeMillis()
+                    val freshTok = silentlyRefreshGoogleToken()
+                    if (freshTok != null) {
+                        pushFreshTokenToCloudJob(appliedBackendUrl, appliedBackendKey, jobId, freshTok)
+                    }
+                }
+
+                if (jobState in listOf("COMPLETED", "PARTIAL_COMPLETE", "FAILED")) {
                     isConverting = false
-                    statusBanner = if (jobState == "COMPLETED") {
-                        "✅ Cloud ZIP64 Ready: $zipFilename (${formatSize(zipSizeBytes)})"
-                    } else {
-                        "Job stopped: $jobCurrentFile"
+                    statusBanner = when (jobState) {
+                        "COMPLETED" -> "✅ All $jobProcessedFiles/$jobTotalFiles Converted! ZIP64 Ready: $zipFilename (${formatSize(zipSizeBytes)})"
+                        "PARTIAL_COMPLETE" -> "⚠️ $jobProcessedFiles/$jobTotalFiles Converted (${jobErrors.size} failed). Tap 'Retry Failed Files Only' below!"
+                        else -> "Job stopped: $jobCurrentFile"
                     }
                     break
                 }
             }
             delay(1500)
+        }
+    }
+
+    fun launchConversionJob(isRetry: Boolean) {
+        isConverting = true
+        zipReady = false
+        savedLocalZipPath = ""
+        jobState = "STARTING"
+        if (!isRetry) {
+            jobOverallPercent = 0f
+            jobProcessedFiles = 0
+            jobFileResults = emptyList()
+        }
+        jobErrors = emptyList()
+        statusBanner = if (isRetry) {
+            "Refreshing Google OAuth token & retrying failed files only (skipping completed)..."
+        } else {
+            "Refreshing token & starting Turbo 4-CPU FFmpeg Conversion..."
+        }
+
+        scope.launch {
+            // Always grab a fresh 60-minute OAuth token right before starting/retrying!
+            val freshTok = silentlyRefreshGoogleToken() ?: appliedOauthToken
+            val startRes = startCloudConversionJob(
+                rawUrl = appliedBackendUrl,
+                backendKey = appliedBackendKey,
+                driveLink = driveLinkInput,
+                bulkQuality = appliedBulkQuality,
+                videoOverrides = appliedVideoOverrides,
+                oauthToken = freshTok,
+                driveApiKey = appliedDriveApiKey
+            )
+            startRes.onSuccess { jobObj ->
+                applyJobSnapshot(jobObj)
+                statusBanner = "Cloud Job Running: $activeJobId"
+                pollJobUntilDone(activeJobId)
+            }.onFailure { err ->
+                isConverting = false
+                statusBanner = "Failed to start job: ${err.message}"
+            }
         }
     }
 
@@ -343,7 +428,6 @@ fun MilestoneSixScreen() {
         }
     }
 
-    // Native AccountPicker Launcher (Bypasses GoogleSignIn ApiException 10 completely!)
     val accountPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartActivityForResult()
     ) { result ->
@@ -355,9 +439,14 @@ fun MilestoneSixScreen() {
                 signedInEmail = email
                 prefs.edit().putString("signed_in_email", email).apply()
                 pendingAccount = acct
-                statusBanner = "Requesting Google Drive token for $email..."
+                statusBanner = "Requesting fresh Google Drive token for $email..."
                 scope.launch(Dispatchers.IO) {
                     try {
+                        if (appliedOauthToken.isNotBlank()) {
+                            try {
+                                GoogleAuthUtil.clearToken(context, appliedOauthToken)
+                            } catch (_: Exception) {}
+                        }
                         val token = GoogleAuthUtil.getToken(
                             context,
                             acct,
@@ -367,7 +456,7 @@ fun MilestoneSixScreen() {
                             appliedOauthToken = token
                             draftOauthToken = token
                             prefs.edit().putString("oauth_token", token).apply()
-                            statusBanner = "✅ Signed in as $email! OAuth Token Auto-Applied."
+                            statusBanner = "✅ Signed in as $email! Fresh 60-Min OAuth Token Applied."
                             Toast.makeText(context, "Signed in: $email", Toast.LENGTH_SHORT).show()
                         }
                     } catch (re: UserRecoverableAuthException) {
@@ -382,21 +471,19 @@ fun MilestoneSixScreen() {
                         }
                     } catch (e: Exception) {
                         withContext(Dispatchers.Main) {
-                            statusBanner = "❌ OAuth Error (${e.javaClass.simpleName}): ${e.message}\nMake sure SHA-1 (31:4D:B5...) is saved in Google Cloud Console!"
+                            statusBanner = "❌ OAuth Error (${e.javaClass.simpleName}): ${e.message}"
                             Toast.makeText(context, "Auth Error: ${e.message}", Toast.LENGTH_LONG).show()
                         }
                     }
                 }
             }
-        } else {
-            statusBanner = "⚠️ Account selection cancelled."
         }
     }
 
     LaunchedEffect(Unit) {
         var activeUrl = appliedBackendUrl
         if (activeUrl.isBlank()) {
-            val fetched = fetchLiveUrlUncached(appliedGhRepo)
+            val fetched = fetchLiveUrlUncached(appliedGhRepo, appliedGhPat)
             if (fetched != null) {
                 activeUrl = fetched
                 appliedBackendUrl = fetched
@@ -414,8 +501,6 @@ fun MilestoneSixScreen() {
                 if (st in listOf("STARTING", "CONVERTING", "PACKAGING_ZIP")) {
                     statusBanner = "Reconnected to active cloud job: ${jobObj.optString("title", "")}"
                     pollJobUntilDone(jobObj.getString("job_id"))
-                } else if (st == "COMPLETED") {
-                    statusBanner = "✅ Found completed ZIP64 on cloud: $zipFilename (${formatSize(zipSizeBytes)})"
                 }
             }
         }
@@ -434,7 +519,6 @@ fun MilestoneSixScreen() {
                 .padding(20.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
-            // GLOBAL LIVE STATUS BANNER (Visible on BOTH Tab 1 and Tab 2!)
             Surface(
                 color = MaterialTheme.colorScheme.secondaryContainer,
                 shape = MaterialTheme.shapes.small,
@@ -449,7 +533,6 @@ fun MilestoneSixScreen() {
             }
 
             if (selectedTab == 0) {
-                // SCANNER INPUT CARD
                 Card(modifier = Modifier.fillMaxWidth()) {
                     Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                         Row(
@@ -461,7 +544,7 @@ fun MilestoneSixScreen() {
                             OutlinedButton(onClick = {
                                 scope.launch {
                                     statusBanner = "Fetching latest live backend URL from GitHub..."
-                                    val url = fetchLiveUrlUncached(appliedGhRepo)
+                                    val url = fetchLiveUrlUncached(appliedGhRepo, appliedGhPat)
                                     if (url != null) {
                                         appliedBackendUrl = url
                                         draftBackendUrl = url
@@ -501,20 +584,21 @@ fun MilestoneSixScreen() {
                                 folderSummary = null
                                 draftVideoOverrides = emptyMap()
                                 appliedVideoOverrides = emptyMap()
-                                statusBanner = "Scanning all subfolders recursively (PDFs + Videos)..."
+                                statusBanner = "Refreshing token & scanning all subfolders recursively..."
                                 scope.launch {
+                                    val freshTok = silentlyRefreshGoogleToken() ?: appliedOauthToken
                                     val res = scanFolderOrFileRecursive(
                                         rawUrl = appliedBackendUrl,
                                         backendKey = appliedBackendKey,
                                         driveLink = driveLinkInput,
-                                        oauthToken = appliedOauthToken,
+                                        oauthToken = freshTok,
                                         driveApiKey = appliedDriveApiKey
                                     )
                                     res.onSuccess { summary ->
                                         folderSummary = summary
-                                        statusBanner = "Scan Complete: ${summary.title} (${summary.documentCount} PDFs/Docs, ${summary.videoCount} Videos)"
+                                        statusBanner = "✅ Scan Complete: ${summary.title} (${summary.documentCount} PDFs/Docs, ${summary.videoCount} Videos)"
                                     }.onFailure { err ->
-                                        statusBanner = "Scan Error: ${err.message}"
+                                        statusBanner = "❌ Scan Error: ${err.message}"
                                     }
                                     isBusy = false
                                 }
@@ -527,7 +611,6 @@ fun MilestoneSixScreen() {
                     }
                 }
 
-                // SUMMARY & CONVERSION TRIGGER CARD
                 folderSummary?.let { summary ->
                     val qualitiesList = listOf("Original", "480p", "360p", "240p", "144p")
 
@@ -624,50 +707,18 @@ fun MilestoneSixScreen() {
                             )
 
                             Button(
-                                onClick = {
-                                    isConverting = true
-                                    zipReady = false
-                                    savedLocalZipPath = ""
-                                    jobState = "STARTING"
-                                    jobOverallPercent = 0f
-                                    jobProcessedFiles = 0
-                                    jobTotalFiles = summary.totalFiles.coerceAtLeast(1)
-                                    jobFileResults = emptyList()
-                                    jobErrors = emptyList()
-                                    statusBanner = "Starting Cloud FFmpeg Conversion & ZIP64 Packaging..."
-
-                                    scope.launch {
-                                        val startRes = startCloudConversionJob(
-                                            rawUrl = appliedBackendUrl,
-                                            backendKey = appliedBackendKey,
-                                            driveLink = driveLinkInput,
-                                            bulkQuality = appliedBulkQuality,
-                                            videoOverrides = appliedVideoOverrides,
-                                            oauthToken = appliedOauthToken,
-                                            driveApiKey = appliedDriveApiKey
-                                        )
-                                        startRes.onSuccess { jobObj ->
-                                            applyJobSnapshot(jobObj)
-                                            statusBanner = "Cloud Job Running: $activeJobId"
-                                            pollJobUntilDone(activeJobId)
-                                        }.onFailure { err ->
-                                            isConverting = false
-                                            statusBanner = "Failed to start job: ${err.message}"
-                                        }
-                                    }
-                                },
+                                onClick = { launchConversionJob(isRetry = false) },
                                 enabled = !isConverting && !isDownloadingZip,
                                 modifier = Modifier.fillMaxWidth().height(54.dp)
                             ) {
                                 Text(
-                                    if (isConverting) "⚙️ Cloud Processing (${String.format(Locale.US, "%.1f", jobOverallPercent)}%)..."
-                                    else "⚙️ Start Cloud FFmpeg Conversion & Build ZIP64 ($appliedBulkQuality)"
+                                    if (isConverting) "⚡ Turbo Cloud Processing (${String.format(Locale.US, "%.1f", jobOverallPercent)}%)..."
+                                    else "⚡ Start Turbo Cloud FFmpeg & Build ZIP64 ($appliedBulkQuality)"
                                 )
                             }
                         }
                     }
 
-                    // SEPARATED SECTION 1: PDFS & NON-VIDEO FILES
                     Card(modifier = Modifier.fillMaxWidth()) {
                         Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                             Row(
@@ -697,7 +748,6 @@ fun MilestoneSixScreen() {
                         }
                     }
 
-                    // SEPARATED SECTION 2: VIDEOS & INDIVIDUAL OVERRIDES
                     Card(modifier = Modifier.fillMaxWidth()) {
                         Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                             Row(
@@ -774,7 +824,7 @@ fun MilestoneSixScreen() {
                     }
                 }
 
-                // LIVE CONVERSION, PACKAGING & RESUMABLE DOWNLOAD CARD
+                // LIVE CONVERSION, RETRY FAILED & RESUMABLE DOWNLOAD CARD
                 if (jobState.isNotBlank()) {
                     Card(modifier = Modifier.fillMaxWidth()) {
                         Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -806,7 +856,7 @@ fun MilestoneSixScreen() {
                             )
 
                             Text(
-                                text = "State: $jobState (${String.format(Locale.US, "%.1f", jobOverallPercent)}% • $jobProcessedFiles / $jobTotalFiles files done)\n" +
+                                text = "State: $jobState (${String.format(Locale.US, "%.1f", jobOverallPercent)}% • $jobProcessedFiles / $jobTotalFiles succeeded • ${jobErrors.size} failed)\n" +
                                        "Live Activity: $jobCurrentFile",
                                 fontFamily = FontFamily.Monospace,
                                 fontWeight = FontWeight.Medium
@@ -826,11 +876,25 @@ fun MilestoneSixScreen() {
                                 )
                             }
 
+                            // 1-TAP RETRY FAILED FILES ONLY BUTTON (Skips all already-completed videos!)
+                            if (!isConverting && jobErrors.isNotEmpty() && driveLinkInput.isNotBlank()) {
+                                Button(
+                                    onClick = { launchConversionJob(isRetry = true) },
+                                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+                                    modifier = Modifier.fillMaxWidth().height(54.dp)
+                                ) {
+                                    Text("🔄 Retry ${jobErrors.size} Failed File(s) Only (Keep $jobProcessedFiles Completed)")
+                                }
+                            }
+
                             if (zipReady && activeJobId.isNotBlank()) {
                                 Divider()
                                 Text(
-                                    text = "📦 Final Unified ZIP64 Archive Ready!\n" +
-                                           "File: $zipFilename (${formatSize(zipSizeBytes)})",
+                                    text = if (jobErrors.isEmpty()) {
+                                        "📦 Final Unified ZIP64 Archive Ready (100% Complete)!\nFile: $zipFilename (${formatSize(zipSizeBytes)})"
+                                    } else {
+                                        "📦 Partial ZIP64 Archive ($jobProcessedFiles/$jobTotalFiles files — Retry failed above for full ZIP):\nFile: $zipFilename (${formatSize(zipSizeBytes)})"
+                                    },
                                     fontWeight = FontWeight.Bold,
                                     color = MaterialTheme.colorScheme.primary
                                 )
@@ -883,12 +947,12 @@ fun MilestoneSixScreen() {
                                             isDownloadingZip = false
                                         }
                                     },
-                                    enabled = !isDownloadingZip,
+                                    enabled = !isDownloadingZip && !isConverting,
                                     modifier = Modifier.fillMaxWidth().height(54.dp)
                                 ) {
                                     Text(
                                         when {
-                                            isDownloadingZip -> "📥 Downloading to Tablet (${formatSize(zipDownloadedBytes)} / ${formatSize(zipSizeBytes)})..."
+                                            isDownloadingZip -> "📥 High-Speed Downloading (${formatSize(zipDownloadedBytes)} / ${formatSize(zipSizeBytes)})..."
                                             savedLocalZipPath.isNotBlank() -> "✅ Downloaded! Tap to Re-Verify / Download Again"
                                             zipDownloadedBytes > 0L -> "▶️ Resume ZIP Download from ${formatSize(zipDownloadedBytes)}"
                                             else -> "📥 Download Final ZIP to Tablet (${formatSize(zipSizeBytes)})"
@@ -922,7 +986,7 @@ fun MilestoneSixScreen() {
 
                             if (jobErrors.isNotEmpty()) {
                                 Divider()
-                                Text("Errors (${jobErrors.size}):", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.error)
+                                Text("Failed Files (${jobErrors.size}) — Tap 'Retry Failed Files Only' Above:", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.error)
                                 jobErrors.forEach { err ->
                                     Text(err, color = MaterialTheme.colorScheme.error, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
                                 }
@@ -931,7 +995,7 @@ fun MilestoneSixScreen() {
                     }
                 }
             } else {
-                // TAB 2: BACKEND & GOOGLE AUTH SETUP WITH EXPLICIT APPLY BUTTONS
+                // TAB 2: BACKEND & GOOGLE AUTH SETUP
                 Card(modifier = Modifier.fillMaxWidth()) {
                     Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                         Text("Section 1: GitHub Cloud Backend Controller", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
@@ -969,26 +1033,42 @@ fun MilestoneSixScreen() {
                                 onClick = {
                                     isBusy = true
                                     scope.launch {
-                                        statusBanner = "Restarting 4-CPU GitHub Cloud Server (~45s)..."
+                                        val oldUrl1 = appliedBackendUrl.trim()
+                                        val oldUrl2 = fetchLiveUrlUncached(appliedGhRepo, appliedGhPat)?.trim() ?: ""
+                                        draftBackendUrl = "Restarting cloud tunnel..."
+                                        statusBanner = "Triggering fresh 4-CPU GitHub Cloud Server (old URL cleared)..."
+
                                         val triggered = triggerGitHubBackendWorkflow(appliedGhRepo, appliedGhPat)
                                         if (!triggered) {
-                                            statusBanner = "Could not trigger via token. Start 'Run DriveZip Cloud Backend' in GitHub Actions."
+                                            draftBackendUrl = oldUrl1
+                                            statusBanner = "❌ Could not trigger workflow. Check your GitHub Token (ghp_...) permissions."
                                             isBusy = false
                                             return@launch
                                         }
-                                        val previousUrl = fetchLiveUrlUncached(appliedGhRepo)
-                                        for (i in 1..25) {
-                                            delay(4000)
-                                            statusBanner = "Waiting for new tunnel URL (${i * 4}s)..."
-                                            val candidate = fetchLiveUrlUncached(appliedGhRepo)
-                                            if (candidate != null && candidate != previousUrl) {
-                                                appliedBackendUrl = candidate
-                                                draftBackendUrl = candidate
-                                                prefs.edit().putString("backend_url", candidate).apply()
+
+                                        var foundNew = false
+                                        for (i in 1..35) {
+                                            delay(3000)
+                                            statusBanner = "Waiting for brand-new .trycloudflare.com URL (${i * 3}s)..."
+                                            val candidate = fetchLiveUrlUncached(appliedGhRepo, appliedGhPat)?.trim()
+                                            if (!candidate.isNullOrBlank() && candidate != oldUrl1 && candidate != oldUrl2) {
                                                 val health = checkBackendHealth(candidate, appliedBackendKey)
-                                                statusBanner = "Cloud Server Awake & Applied: $candidate\n$health"
-                                                break
+                                                if (health.startsWith("HEALTH OK")) {
+                                                    appliedBackendUrl = candidate
+                                                    draftBackendUrl = candidate
+                                                    prefs.edit().putString("backend_url", candidate).apply()
+                                                    statusBanner = "✅ Brand-New Cloud URL Active & Verified!\n$candidate\n$health"
+                                                    Toast.makeText(context, "New Cloud URL Connected!", Toast.LENGTH_LONG).show()
+                                                    foundNew = true
+                                                    break
+                                                }
                                             }
+                                        }
+                                        if (!foundNew) {
+                                            val fallback = fetchLiveUrlUncached(appliedGhRepo, appliedGhPat) ?: oldUrl1
+                                            appliedBackendUrl = fallback
+                                            draftBackendUrl = fallback
+                                            statusBanner = "⚠️ Timed out waiting for new URL. Tap 'Sync & Test URL' in 10 seconds."
                                         }
                                         isBusy = false
                                     }
@@ -996,13 +1076,14 @@ fun MilestoneSixScreen() {
                                 enabled = !isBusy && appliedGhPat.isNotBlank(),
                                 modifier = Modifier.weight(1f)
                             ) {
-                                Text("🚀 1-Tap Wake / Restart Cloud")
+                                Text(if (isBusy) "⏳ Restarting..." else "🚀 1-Tap Wake / Restart Cloud")
                             }
 
                             OutlinedButton(
                                 onClick = {
                                     scope.launch {
-                                        val url = fetchLiveUrlUncached(appliedGhRepo)
+                                        statusBanner = "Syncing live_url.txt from GitHub..."
+                                        val url = fetchLiveUrlUncached(appliedGhRepo, appliedGhPat)
                                         if (url != null) {
                                             appliedBackendUrl = url
                                             draftBackendUrl = url
@@ -1115,7 +1196,7 @@ fun MilestoneSixScreen() {
                         }
 
                         Divider()
-                        Text("Option B — Private & 'Shared with me' Folders (OAuth 2.0):", fontWeight = FontWeight.SemiBold)
+                        Text("Option B — Private & 'Shared with me' Folders (Auto-Refreshing OAuth 2.0):", fontWeight = FontWeight.SemiBold)
                         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                             Button(onClick = {
                                 val intent = AccountPicker.newChooseAccountIntent(
@@ -1144,7 +1225,7 @@ fun MilestoneSixScreen() {
                         OutlinedTextField(
                             value = draftOauthToken,
                             onValueChange = { draftOauthToken = it.trim() },
-                            label = { Text("OAuth 2.0 Access Token (Auto-filled on Sign In or paste ya29... token)") },
+                            label = { Text("OAuth 2.0 Access Token (Auto-refreshed every 25m during jobs)") },
                             modifier = Modifier.fillMaxWidth(),
                             singleLine = true
                         )
@@ -1196,8 +1277,10 @@ private suspend fun downloadZipResumableToTablet(
         }
 
         val cleanUrl = rawUrl.trimEnd('/')
-        val chunkSize = 16L * 1024L * 1024L
+        val chunkSize = 32L * 1024L * 1024L // 32 MB high-speed chunks
         val client = buildHttpClient()
+        val startTimeMs = System.currentTimeMillis()
+        val initialBytes = downloaded
 
         while (downloaded < totalBytes || totalBytes == 0L) {
             val endByte = if (totalBytes > 0L) minOf(downloaded + chunkSize - 1, totalBytes - 1) else downloaded + chunkSize - 1
@@ -1221,19 +1304,28 @@ private suspend fun downloadZipResumableToTablet(
                         val body = resp.body ?: throw RuntimeException("Empty response body")
                         RandomAccessFile(partFile, "rw").use { raf ->
                             raf.seek(downloaded)
-                            val buf = ByteArray(256 * 1024)
+                            val buf = ByteArray(1024 * 1024) // 1 MB buffer
                             val stream = body.byteStream()
+                            var lastUiUpdateMs = 0L
                             while (true) {
                                 val read = stream.read(buf)
                                 if (read == -1) break
                                 raf.write(buf, 0, read)
                                 downloaded += read
-                                val pct = if (totalBytes > 0L) (downloaded * 100L) / totalBytes else 0L
-                                withContext(Dispatchers.Main) {
-                                    onProgress(
-                                        downloaded,
-                                        "📥 Downloading to Tablet: ${formatSize(downloaded)} / ${formatSize(totalBytes)} ($pct%)"
-                                    )
+                                val now = System.currentTimeMillis()
+                                // Throttle UI updates to once every 400ms for 10x faster download throughput!
+                                if (now - lastUiUpdateMs >= 400L || downloaded == totalBytes) {
+                                    lastUiUpdateMs = now
+                                    val pct = if (totalBytes > 0L) (downloaded * 100L) / totalBytes else 0L
+                                    val elapsedSec = ((now - startTimeMs) / 1000.0).coerceAtLeast(0.5)
+                                    val speedMb = ((downloaded - initialBytes) / (1024.0 * 1024.0)) / elapsedSec
+                                    val speedStr = String.format(Locale.US, "%.1f MB/s", speedMb)
+                                    withContext(Dispatchers.Main) {
+                                        onProgress(
+                                            downloaded,
+                                            "📥 Downloading to Tablet: ${formatSize(downloaded)} / ${formatSize(totalBytes)} ($pct% • $speedStr)"
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -1289,15 +1381,17 @@ private fun getTabletFreeStorageBytes(): Long {
     }
 }
 
-private suspend fun fetchLiveUrlUncached(repo: String): String? = withContext(Dispatchers.IO) {
+private suspend fun fetchLiveUrlUncached(repo: String, pat: String = ""): String? = withContext(Dispatchers.IO) {
     try {
-        val req = Request.Builder()
-            .url("https://api.github.com/repos/${repo.trim()}/contents/live_url.txt?t=${System.currentTimeMillis()}")
+        val reqBuilder = Request.Builder()
+            .url("https://api.github.com/repos/${repo.trim()}/contents/live_url.txt?ref=main&t=${System.currentTimeMillis()}")
             .header("Accept", "application/vnd.github.v3.raw")
-            .header("Cache-Control", "no-cache")
-            .get()
-            .build()
-        buildHttpClient().newCall(req).execute().use { resp ->
+            .header("Cache-Control", "no-cache, no-store, must-revalidate")
+            .header("Pragma", "no-cache")
+        if (pat.isNotBlank()) {
+            reqBuilder.header("Authorization", "Bearer ${pat.trim()}")
+        }
+        buildHttpClient().newCall(reqBuilder.get().build()).execute().use { resp ->
             if (!resp.isSuccessful) return@withContext null
             val txt = resp.body?.string()?.trim() ?: ""
             if (txt.startsWith("https://")) txt else null
@@ -1345,6 +1439,21 @@ private suspend fun fetchActiveCloudJob(rawUrl: String, key: String): JSONObject
         }
     } catch (_: Exception) {
         null
+    }
+}
+
+private suspend fun pushFreshTokenToCloudJob(rawUrl: String, key: String, jobId: String, freshToken: String): Boolean = withContext(Dispatchers.IO) {
+    try {
+        val clean = rawUrl.trimEnd('/')
+        val body = JSONObject().put("oauth_token", freshToken).toString()
+        val req = Request.Builder()
+            .url("$clean/api/v1/jobs/$jobId/refresh_token")
+            .addHeader("X-Backend-Key", key)
+            .post(body.toRequestBody("application/json".toMediaType()))
+            .build()
+        buildHttpClient().newCall(req).execute().use { it.isSuccessful }
+    } catch (_: Exception) {
+        false
     }
 }
 
