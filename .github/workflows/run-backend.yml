@@ -8,6 +8,10 @@ on:
         required: false
         default: '240'
 
+concurrency:
+  group: drivezip-cloud-backend
+  cancel-in-progress: true
+
 permissions:
   contents: write
 
