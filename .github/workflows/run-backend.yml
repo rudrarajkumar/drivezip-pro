@@ -1,0 +1,65 @@
+name: Run DriveZip Cloud Backend
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: 'Minutes to keep cloud server running (max 350)'
+        required: false
+        default: '240'
+
+permissions:
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  cloud-backend:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install FFmpeg, Python Venv & Cloudflared
+        run: |
+          sudo apt-get update -y && sudo apt-get install -y ffmpeg python3-venv
+          python3 -m venv venv
+          ./venv/bin/pip install --upgrade pip
+          ./venv/bin/pip install fastapi uvicorn httpx pydantic
+          wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O cloudflared
+          chmod +x cloudflared
+
+      - name: Start FastAPI & Publish Live Tunnel URL
+        run: |
+          nohup ./venv/bin/uvicorn backend.app:app --host 127.0.0.1 --port 8000 > server.log 2>&1 &
+          sleep 3
+          rm -f tunnel.log
+          nohup ./cloudflared tunnel --url http://127.0.0.1:8000 --logfile tunnel.log > /dev/null 2>&1 &
+          URL=""
+          for i in $(seq 1 30); do
+            sleep 1
+            if [ -f tunnel.log ]; then
+              URL=$(grep -oE "https://[a-zA-Z0-9-]+\.trycloudflare\.com" tunnel.log | tail -n 1 || true)
+              if [ -n "$URL" ]; then
+                break
+              fi
+            fi
+          done
+          echo "LIVE URL: $URL"
+          echo "### 🚀 DriveZip Pro Cloud Server Active" >> $GITHUB_STEP_SUMMARY
+          echo "**Live URL:** \`$URL\`" >> $GITHUB_STEP_SUMMARY
+          echo -n "$URL" > live_url.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git pull --rebase origin main || true
+          git add live_url.txt
+          git commit -m "Update live backend tunnel URL [skip ci]" || true
+          git push origin HEAD:main || true
+
+      - name: Keep Server Alive
+        run: |
+          MINS="${{ github.event.inputs.duration_minutes || '240' }}"
+          echo "Server running for $MINS minutes..."
+          sleep $((MINS * 60))
