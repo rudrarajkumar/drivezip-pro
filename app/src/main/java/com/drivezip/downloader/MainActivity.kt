@@ -48,6 +48,8 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
+import java.io.RandomAccessFile
 import java.net.InetAddress
 import java.security.MessageDigest
 import java.util.Locale
@@ -59,7 +61,7 @@ class MainActivity : ComponentActivity() {
         setContent {
             MaterialTheme {
                 Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-                    MilestoneThreeScreen()
+                    MilestoneFourScreen()
                 }
             }
         }
@@ -122,7 +124,7 @@ fun buildHttpClient(): OkHttpClient {
     return OkHttpClient.Builder()
         .dns(JioSafeDns)
         .connectTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(90, TimeUnit.SECONDS)
+        .readTimeout(120, TimeUnit.SECONDS)
         .build()
 }
 
@@ -181,7 +183,7 @@ data class ConvertedFileResult(
 )
 
 @Composable
-fun MilestoneThreeScreen() {
+fun MilestoneFourScreen() {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val prefs = remember { getSecurePrefs(context) }
@@ -226,7 +228,8 @@ fun MilestoneThreeScreen() {
     var isConverting by remember { mutableStateOf(false) }
     var statusBanner by remember { mutableStateOf("Ready. Paste a Google Drive folder or file link below.") }
 
-    // Conversion Job Live States
+    // Conversion & Packaging Job States
+    var activeJobId by remember { mutableStateOf("") }
     var jobState by remember { mutableStateOf("") }
     var jobCurrentFile by remember { mutableStateOf("") }
     var jobProcessedFiles by remember { mutableStateOf(0) }
@@ -235,6 +238,15 @@ fun MilestoneThreeScreen() {
     var jobActualBytesSoFar by remember { mutableStateOf(0L) }
     var jobFileResults by remember { mutableStateOf<List<ConvertedFileResult>>(emptyList()) }
     var jobErrors by remember { mutableStateOf<List<String>>(emptyList()) }
+    var zipReady by remember { mutableStateOf(false) }
+    var zipFilename by remember { mutableStateOf("") }
+    var zipSizeBytes by remember { mutableStateOf(0L) }
+
+    // Tablet Local Chunked Resumable Download States
+    var isDownloadingZip by remember { mutableStateOf(false) }
+    var zipDownloadedBytes by remember { mutableStateOf(0L) }
+    var zipDownloadStatus by remember { mutableStateOf("") }
+    var savedLocalZipPath by remember { mutableStateOf("") }
 
     val recoveryLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartActivityForResult()
@@ -329,7 +341,7 @@ fun MilestoneThreeScreen() {
 
     Column(modifier = Modifier.fillMaxSize()) {
         TabRow(selectedTabIndex = selectedTab) {
-            Tab(selected = selectedTab == 0, onClick = { selectedTab = 0 }, text = { Text("1. Scanner & FFmpeg Engine") })
+            Tab(selected = selectedTab == 0, onClick = { selectedTab = 0 }, text = { Text("1. Scanner, Convert & ZIP") })
             Tab(selected = selectedTab == 1, onClick = { selectedTab = 1 }, text = { Text("2. Backend & Auth Setup") })
         }
 
@@ -389,6 +401,8 @@ fun MilestoneThreeScreen() {
                                 isBusy = true
                                 folderSummary = null
                                 jobState = ""
+                                zipReady = false
+                                savedLocalZipPath = ""
                                 draftVideoOverrides = emptyMap()
                                 appliedVideoOverrides = emptyMap()
                                 statusBanner = "Scanning all subfolders recursively (PDFs + Videos)..."
@@ -409,7 +423,7 @@ fun MilestoneThreeScreen() {
                                     isBusy = false
                                 }
                             },
-                            enabled = !isBusy && !isConverting && driveLinkInput.isNotBlank() && appliedBackendUrl.isNotBlank(),
+                            enabled = !isBusy && !isConverting && !isDownloadingZip && driveLinkInput.isNotBlank() && appliedBackendUrl.isNotBlank(),
                             modifier = Modifier.fillMaxWidth().height(52.dp)
                         ) {
                             Text(if (isBusy) "Scanning All Subfolders..." else "🔍 Scan Folder Recursively & Calculate Sizes")
@@ -521,16 +535,17 @@ fun MilestoneThreeScreen() {
                                 color = if (liveGrandTotalBytes < tabletFreeBytes) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error
                             )
 
-                            // MILESTONE 3 ACTION BUTTON: START CLOUD FFMPEG ENGINE
                             Button(
                                 onClick = {
                                     isConverting = true
+                                    zipReady = false
+                                    savedLocalZipPath = ""
                                     jobState = "STARTING"
                                     jobProcessedFiles = 0
                                     jobTotalFiles = summary.totalFiles.coerceAtLeast(1)
                                     jobFileResults = emptyList()
                                     jobErrors = emptyList()
-                                    statusBanner = "Starting parallel FFmpeg conversion job on Cloud Server..."
+                                    statusBanner = "Starting Cloud FFmpeg Conversion & ZIP64 Packaging..."
 
                                     scope.launch {
                                         val startRes = startCloudConversionJob(
@@ -543,7 +558,8 @@ fun MilestoneThreeScreen() {
                                             driveApiKey = appliedDriveApiKey
                                         )
                                         startRes.onSuccess { jobId ->
-                                            statusBanner = "Cloud FFmpeg Job Running: $jobId"
+                                            activeJobId = jobId
+                                            statusBanner = "Cloud Job Running: $jobId"
                                             while (true) {
                                                 delay(2000)
                                                 val pollRes = pollConversionJobStatus(appliedBackendUrl, appliedBackendKey, jobId)
@@ -555,6 +571,9 @@ fun MilestoneThreeScreen() {
                                                     jobTotalFiles = st.optInt("total_files", 1).coerceAtLeast(1)
                                                     jobEstimatedTotalBytes = st.optLong("estimated_total_bytes", 0L)
                                                     jobActualBytesSoFar = st.optLong("actual_bytes_so_far", 0L)
+                                                    zipReady = st.optBoolean("zip_ready", false)
+                                                    zipFilename = st.optString("zip_filename", "DriveZip_Archive.zip")
+                                                    zipSizeBytes = st.optLong("zip_size_bytes", 0L)
 
                                                     val resArr = st.optJSONArray("file_results") ?: JSONArray()
                                                     val parsedResults = mutableListOf<ConvertedFileResult>()
@@ -586,9 +605,9 @@ fun MilestoneThreeScreen() {
                                                     if (jobState == "COMPLETED" || jobState == "FAILED") {
                                                         isConverting = false
                                                         statusBanner = if (jobState == "COMPLETED") {
-                                                            "All conversions finished! Actual total size: ${formatSize(jobActualBytesSoFar)}"
+                                                            "✅ Cloud ZIP64 Ready: $zipFilename (${formatSize(zipSizeBytes)})"
                                                         } else {
-                                                            "Conversion job stopped with errors."
+                                                            "Job stopped with errors."
                                                         }
                                                         break
                                                     }
@@ -598,23 +617,26 @@ fun MilestoneThreeScreen() {
                                             }
                                         }.onFailure { err ->
                                             isConverting = false
-                                            statusBanner = "Failed to start conversion: ${err.message}"
+                                            statusBanner = "Failed to start job: ${err.message}"
                                         }
                                     }
                                 },
-                                enabled = !isConverting,
+                                enabled = !isConverting && !isDownloadingZip,
                                 modifier = Modifier.fillMaxWidth().height(54.dp)
                             ) {
-                                Text(if (isConverting) "⚙️ Converting on Cloud ($jobProcessedFiles / $jobTotalFiles)..." else "⚙️ Start Cloud FFmpeg Conversion ($appliedBulkQuality)")
+                                Text(
+                                    if (isConverting) "⚙️ Processing on Cloud ($jobProcessedFiles / $jobTotalFiles)..."
+                                    else "⚙️ Start Cloud FFmpeg Conversion & Build ZIP64 ($appliedBulkQuality)"
+                                )
                             }
                         }
                     }
 
-                    // LIVE CONVERSION PROGRESS & ESTIMATED VS ACTUAL SIZES CARD
+                    // LIVE CONVERSION, PACKAGING & RESUMABLE DOWNLOAD CARD
                     if (jobState.isNotBlank()) {
                         Card(modifier = Modifier.fillMaxWidth()) {
-                            Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                                Text("Cloud FFmpeg Conversion Progress", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                            Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                                Text("Cloud Conversion & ZIP64 Download Center", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
 
                                 val prog = (jobProcessedFiles.toFloat() / jobTotalFiles.toFloat()).coerceIn(0f, 1f)
                                 LinearProgressIndicator(
@@ -624,7 +646,7 @@ fun MilestoneThreeScreen() {
 
                                 Text(
                                     text = "State: $jobState ($jobProcessedFiles / $jobTotalFiles files)\n" +
-                                           "Current Item: $jobCurrentFile",
+                                           "Live Activity: $jobCurrentFile",
                                     fontFamily = FontFamily.Monospace,
                                     fontWeight = FontWeight.Medium
                                 )
@@ -636,11 +658,83 @@ fun MilestoneThreeScreen() {
                                 ) {
                                     Text(
                                         text = "Estimated Total Size: ${formatSize(jobEstimatedTotalBytes)}\n" +
-                                               "Actual Converted Size So Far: ${formatSize(jobActualBytesSoFar)}",
+                                               "Actual Converted Size: ${formatSize(jobActualBytesSoFar)}",
                                         modifier = Modifier.padding(12.dp),
                                         fontFamily = FontFamily.Monospace,
                                         fontWeight = FontWeight.Bold
                                     )
+                                }
+
+                                // MILESTONE 4: RESUMABLE CHUNKED DOWNLOAD TO TABLET
+                                if (zipReady && activeJobId.isNotBlank()) {
+                                    Divider()
+                                    Text(
+                                        text = "📦 Final Unified ZIP64 Archive Ready!\n" +
+                                               "File: $zipFilename (${formatSize(zipSizeBytes)})",
+                                        fontWeight = FontWeight.Bold,
+                                        color = MaterialTheme.colorScheme.primary
+                                    )
+
+                                    if (zipSizeBytes > 0L && zipDownloadedBytes > 0L) {
+                                        val dlProg = (zipDownloadedBytes.toFloat() / zipSizeBytes.toFloat()).coerceIn(0f, 1f)
+                                        LinearProgressIndicator(
+                                            progress = { dlProg },
+                                            modifier = Modifier.fillMaxWidth().height(8.dp)
+                                        )
+                                    }
+
+                                    if (zipDownloadStatus.isNotBlank()) {
+                                        Text(
+                                            text = zipDownloadStatus,
+                                            fontFamily = FontFamily.Monospace,
+                                            style = MaterialTheme.typography.bodySmall
+                                        )
+                                    }
+
+                                    Button(
+                                        onClick = {
+                                            val freeBytes = getTabletFreeStorageBytes()
+                                            if (zipSizeBytes > freeBytes) {
+                                                Toast.makeText(context, "Not enough free tablet storage!", Toast.LENGTH_LONG).show()
+                                                zipDownloadStatus = "❌ Error: Need ${formatSize(zipSizeBytes)}, but only ${formatSize(freeBytes)} free."
+                                                return@Button
+                                            }
+                                            isDownloadingZip = true
+                                            scope.launch {
+                                                val res = downloadZipResumableToTablet(
+                                                    rawUrl = appliedBackendUrl,
+                                                    backendKey = appliedBackendKey,
+                                                    jobId = activeJobId,
+                                                    zipFilename = zipFilename,
+                                                    totalBytes = zipSizeBytes,
+                                                    onProgress = { dlBytes, msg ->
+                                                        zipDownloadedBytes = dlBytes
+                                                        zipDownloadStatus = msg
+                                                    }
+                                                )
+                                                res.onSuccess { finalFile ->
+                                                    savedLocalZipPath = finalFile.absolutePath
+                                                    zipDownloadStatus = "✅ Saved to Tablet Downloads:\n${finalFile.absolutePath}"
+                                                    statusBanner = "ZIP Download Complete: ${finalFile.name}"
+                                                    Toast.makeText(context, "Saved to Downloads/DriveZip!", Toast.LENGTH_LONG).show()
+                                                }.onFailure { err ->
+                                                    zipDownloadStatus = "⚠️ Paused / Interrupted: ${err.message}\nTap button above to Resume from ${formatSize(zipDownloadedBytes)}!"
+                                                }
+                                                isDownloadingZip = false
+                                            }
+                                        },
+                                        enabled = !isDownloadingZip,
+                                        modifier = Modifier.fillMaxWidth().height(54.dp)
+                                    ) {
+                                        Text(
+                                            when {
+                                                isDownloadingZip -> "📥 Downloading to Tablet (${formatSize(zipDownloadedBytes)} / ${formatSize(zipSizeBytes)})..."
+                                                savedLocalZipPath.isNotBlank() -> "✅ Downloaded! Tap to Re-Verify / Download Again"
+                                                zipDownloadedBytes > 0L -> "▶️ Resume ZIP Download from ${formatSize(zipDownloadedBytes)}"
+                                                else -> "📥 Download Final ZIP to Tablet (${formatSize(zipSizeBytes)})"
+                                            }
+                                        )
+                                    }
                                 }
 
                                 if (jobFileResults.isNotEmpty()) {
@@ -822,7 +916,7 @@ fun MilestoneThreeScreen() {
                                 onClick = {
                                     isBusy = true
                                     scope.launch {
-                                        statusBanner = "Restarting 4-CPU GitHub Cloud Server with Milestone 3 code (~45s)..."
+                                        statusBanner = "Restarting 4-CPU GitHub Cloud Server with Milestone 4 code (~45s)..."
                                         val triggered = triggerGitHubBackendWorkflow(appliedGhRepo, appliedGhPat)
                                         if (!triggered) {
                                             statusBanner = "Could not trigger via token. Start 'Run DriveZip Cloud Backend' in GitHub Actions."
@@ -999,6 +1093,100 @@ fun MilestoneThreeScreen() {
                 }
             }
         }
+    }
+}
+
+private suspend fun downloadZipResumableToTablet(
+    rawUrl: String,
+    backendKey: String,
+    jobId: String,
+    zipFilename: String,
+    totalBytes: Long,
+    onProgress: suspend (Long, String) -> Unit
+): Result<File> = withContext(Dispatchers.IO) {
+    try {
+        val downloadsRoot = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+        val targetDir = File(downloadsRoot, "DriveZip")
+        if (!targetDir.exists()) targetDir.mkdirs()
+
+        val partFile = File(targetDir, "$zipFilename.part")
+        val finalFile = File(targetDir, zipFilename)
+
+        if (finalFile.exists() && finalFile.length() == totalBytes && totalBytes > 0L) {
+            withContext(Dispatchers.Main) {
+                onProgress(totalBytes, "✅ Already downloaded completely!")
+            }
+            return@withContext Result.success(finalFile)
+        }
+
+        var downloaded = if (partFile.exists()) partFile.length() else 0L
+        if (downloaded > totalBytes && totalBytes > 0L) {
+            partFile.delete()
+            downloaded = 0L
+        }
+
+        val cleanUrl = rawUrl.trimEnd('/')
+        val chunkSize = 16L * 1024L * 1024L // 16 MB per HTTP Range chunk
+        val client = buildHttpClient()
+
+        while (downloaded < totalBytes || totalBytes == 0L) {
+            val endByte = if (totalBytes > 0L) minOf(downloaded + chunkSize - 1, totalBytes - 1) else downloaded + chunkSize - 1
+            val reqBuilder = Request.Builder()
+                .url("$cleanUrl/api/v1/jobs/$jobId/download")
+                .addHeader("X-Backend-Key", backendKey)
+
+            if (totalBytes > 0L) {
+                reqBuilder.addHeader("Range", "bytes=$downloaded-$endByte")
+            }
+
+            var chunkSuccess = false
+            var lastErr = ""
+
+            for (attempt in 1..4) {
+                try {
+                    client.newCall(reqBuilder.build()).execute().use { resp ->
+                        if (!resp.isSuccessful && resp.code != 206) {
+                            throw RuntimeException("HTTP ${resp.code}")
+                        }
+                        val body = resp.body ?: throw RuntimeException("Empty response body")
+                        RandomAccessFile(partFile, "rw").use { raf ->
+                            raf.seek(downloaded)
+                            val buf = ByteArray(256 * 1024)
+                            val stream = body.byteStream()
+                            while (true) {
+                                val read = stream.read(buf)
+                                if (read == -1) break
+                                raf.write(buf, 0, read)
+                                downloaded += read
+                                val pct = if (totalBytes > 0L) (downloaded * 100L) / totalBytes else 0L
+                                withContext(Dispatchers.Main) {
+                                    onProgress(
+                                        downloaded,
+                                        "📥 Downloading to Tablet: ${formatSize(downloaded)} / ${formatSize(totalBytes)} ($pct%)"
+                                    )
+                                }
+                            }
+                        }
+                        chunkSuccess = true
+                    }
+                    if (chunkSuccess) break
+                } catch (e: Exception) {
+                    lastErr = e.message ?: "Network error"
+                    delay(1500L * attempt)
+                }
+            }
+
+            if (!chunkSuccess) {
+                return@withContext Result.failure(RuntimeException("Connection dropped ($lastErr)"))
+            }
+            if (totalBytes == 0L) break
+        }
+
+        if (finalFile.exists()) finalFile.delete()
+        partFile.renameTo(finalFile)
+        Result.success(finalFile)
+    } catch (e: Exception) {
+        Result.failure(e)
     }
 }
 
