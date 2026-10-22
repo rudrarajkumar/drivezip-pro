@@ -14,13 +14,12 @@ from fastapi import FastAPI, Header, HTTPException, Depends, Request
 from fastapi.responses import FileResponse, StreamingResponse, Response
 from pydantic import BaseModel
 
-app = FastAPI(title="DriveZip Pro Cloud Backend", version="5.0.0")
+app = FastAPI(title="DriveZip Pro Cloud Backend", version="7.0.0")
 
 BACKEND_API_KEY = os.environ.get("BACKEND_API_KEY", "drivezip2026secret")
 WORK_DIR = Path("/tmp/drivezip_jobs")
 WORK_DIR.mkdir(parents=True, exist_ok=True)
 
-# YouTube-grade lecture bitrates: target height, video bitrate (kbps), audio bitrate (kbps)
 QUALITY_PRESETS = {
     "480p": {"height": 480, "v_kbps": 400, "a_kbps": 64},
     "360p": {"height": 360, "v_kbps": 220, "a_kbps": 64},
@@ -94,7 +93,7 @@ def build_drive_auth(oauth_token: str, api_key: str):
     else:
         raise HTTPException(
             status_code=400,
-            detail="Missing Google Auth! In Tab 2, Apply your Google Drive API Key or Sign In with Google.",
+            detail="Missing Google Auth! In Tab 2, Sign In with Google or Apply your Drive API Key.",
         )
     return headers, params
 
@@ -104,6 +103,8 @@ def drive_api_get(client: httpx.Client, url: str, headers: dict, params: dict) -
         resp = client.get(url, headers=headers, params=params, timeout=30.0)
         if resp.status_code == 200:
             return resp.json()
+        if resp.status_code == 401:
+            raise HTTPException(status_code=401, detail="Google OAuth Token expired (HTTP 401). Please re-sign in on Tab 2.")
         if resp.status_code in (429, 500, 502, 503, 504):
             time.sleep(1.5 * (attempt + 1))
             continue
@@ -325,7 +326,6 @@ def fmt_hms(sec: float) -> str:
 
 
 def update_live_progress(job_id: str, item_idx: int, total_items: int, item_fraction: float, message: str):
-    """Updates overall_percent smoothly from 0% to 100% even when converting a single video."""
     overall = ((item_idx - 1 + max(0.0, min(item_fraction, 1.0))) / float(max(total_items, 1))) * 100.0
     with JOBS_LOCK:
         if job_id in ACTIVE_JOBS:
@@ -357,6 +357,8 @@ def download_drive_file_with_progress(
     for attempt in range(4):
         with httpx.Client(follow_redirects=True, timeout=180.0) as client:
             with client.stream("GET", url, headers=headers, params=params) as resp:
+                if resp.status_code == 401:
+                    raise RuntimeError("HTTP 401: Google OAuth Token expired. Please re-sign in on Tab 2.")
                 if resp.status_code == 200:
                     downloaded = 0
                     last_tick = 0.0
@@ -370,7 +372,6 @@ def download_drive_file_with_progress(
                             if now - last_tick >= 1.2:
                                 last_tick = now
                                 dl_ratio = min(downloaded / float(orig_bytes), 1.0)
-                                # If video needs transcoding, download represents first 30% of the item's work
                                 item_frac = dl_ratio * 0.30 if is_transcode else dl_ratio
                                 pct = int(dl_ratio * 100)
                                 dl_mb = downloaded / (1024 * 1024)
@@ -618,7 +619,7 @@ def run_conversion_and_zip_job(
                 ACTIVE_JOBS[job_id]["processed_files"] = idx
                 ACTIVE_JOBS[job_id]["errors"].append(f"{item['name']}: {str(e)}")
 
-    # STEP 3: PACKAGE ALL FILES INTO ONE UNIFIED ZIP64 PRESERVING FOLDER STRUCTURE
+    # STEP 3: PACKAGE ALL FILES INTO ONE UNIFIED ZIP64
     try:
         zip_filename = f"{sanitize_filename(scan_data['title'])}_{bulk_quality}.zip"
         zip_path = job_dir / zip_filename
@@ -670,13 +671,13 @@ class StartJobRequest(BaseModel):
 
 @app.get("/")
 def root():
-    return {"service": "DriveZip Pro Cloud Backend", "milestone": 5, "status": "online", "gpu": HAS_GPU}
+    return {"service": "DriveZip Pro Cloud Backend", "milestone": 7, "status": "online", "gpu": HAS_GPU}
 
 
 @app.get("/api/v1/health")
 def health(_: bool = Depends(verify_key)):
     total, used, free = shutil.disk_usage(WORK_DIR)
-    return {"authenticated": True, "milestone": 5, "disk_free_gb": round(free / (1024 ** 3), 2), "gpu": HAS_GPU}
+    return {"authenticated": True, "milestone": 7, "disk_free_gb": round(free / (1024 ** 3), 2), "gpu": HAS_GPU}
 
 
 @app.post("/api/v1/inspect")
@@ -687,7 +688,6 @@ def inspect_resource(req: InspectRequest, _: bool = Depends(verify_key)):
 
 @app.get("/api/v1/jobs/active")
 def get_active_job(_: bool = Depends(verify_key)):
-    """Returns the most recent active or completed job so the tablet can auto-reconnect."""
     with JOBS_LOCK:
         if not ACTIVE_JOBS:
             return {"has_active": False}
