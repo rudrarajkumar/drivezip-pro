@@ -13,7 +13,7 @@ import httpx
 from fastapi import FastAPI, Header, HTTPException, Depends
 from pydantic import BaseModel
 
-app = FastAPI(title="DriveZip Pro Cloud Backend", version="3.0.0")
+app = FastAPI(title="DriveZip Pro Cloud Backend", version="3.1.0")
 
 BACKEND_API_KEY = os.environ.get("BACKEND_API_KEY", "drivezip2026secret")
 WORK_DIR = Path("/tmp/drivezip_jobs")
@@ -317,7 +317,7 @@ def scan_drive_recursive(resource_id: str, oauth_token: str, api_key: str) -> di
     }
 
 
-def download_drive_file(file_info: dict, dest_path: Path, headers: dict, base_params: dict):
+def download_drive_file(file_info: dict, dest_path: Path, headers: dict, base_params: dict, job_id: str = ""):
     fid = file_info["id"]
     if file_info.get("is_workspace", False):
         url = f"https://www.googleapis.com/drive/v3/files/{fid}/export"
@@ -327,13 +327,26 @@ def download_drive_file(file_info: dict, dest_path: Path, headers: dict, base_pa
         params = {**base_params, "alt": "media", "acknowledgeAbuse": "true"}
 
     dest_path.parent.mkdir(parents=True, exist_ok=True)
+    expected_size = file_info.get("orig_size", 0)
+
     for attempt in range(4):
-        with httpx.Client(follow_redirects=True, timeout=120.0) as client:
+        with httpx.Client(follow_redirects=True, timeout=180.0) as client:
             with client.stream("GET", url, headers=headers, params=params) as resp:
                 if resp.status_code == 200:
+                    downloaded = 0
+                    last_update = time.time()
                     with open(dest_path, "wb") as f:
                         for chunk in resp.iter_bytes(chunk_size=1024 * 512):
                             f.write(chunk)
+                            downloaded += len(chunk)
+                            # Update live download progress every 2 seconds
+                            if job_id and (time.time() - last_update > 2.0):
+                                last_update = time.time()
+                                dl_mb = round(downloaded / (1024 * 1024), 1)
+                                tot_mb = round(expected_size / (1024 * 1024), 1) if expected_size > 0 else "?"
+                                with JOBS_LOCK:
+                                    if job_id in ACTIVE_JOBS:
+                                        ACTIVE_JOBS[job_id]["current_file"] = f"📥 Downloading from Drive ({dl_mb} / {tot_mb} MB): {file_info['name']}"
                     return
                 if resp.status_code in (429, 500, 502, 503, 504):
                     time.sleep(2.0 * (attempt + 1))
@@ -342,11 +355,16 @@ def download_drive_file(file_info: dict, dest_path: Path, headers: dict, base_pa
     raise RuntimeError(f"Download failed after retries: {file_info['name']}")
 
 
-def convert_video_ffmpeg(src_path: Path, dst_path: Path, target_quality: str):
+def convert_video_ffmpeg(src_path: Path, dst_path: Path, target_quality: str, job_id: str = "", file_name: str = ""):
     preset = QUALITY_PRESETS[target_quality]
     h = preset["height"]
     v_kbps = preset["v_kbps"]
     a_kbps = preset["a_kbps"]
+
+    if job_id:
+        with JOBS_LOCK:
+            if job_id in ACTIVE_JOBS:
+                ACTIVE_JOBS[job_id]["current_file"] = f"⚙️ Encoding {target_quality} across 4 CPU cores: {file_name}"
 
     scale_filter = f"scale=-2:'min(ih,{h})'"
     if HAS_GPU:
@@ -358,15 +376,15 @@ def convert_video_ffmpeg(src_path: Path, dst_path: Path, target_quality: str):
             "-bufsize", f"{v_kbps * 2}k",
         ]
     else:
+        # Optimized for maximum 4-CPU throughput (4x faster than veryfast)
         v_codec = [
             "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-tune", "stillimage",
-            "-crf", "30",
+            "-preset", "ultrafast",
+            "-crf", "28",
             "-b:v", f"{v_kbps}k",
-            "-maxrate", f"{int(v_kbps * 1.15)}k",
+            "-maxrate", f"{int(v_kbps * 1.2)}k",
             "-bufsize", f"{v_kbps * 2}k",
-            "-threads", "2",
+            "-threads", "0",
         ]
 
     cmd = [
@@ -440,6 +458,7 @@ def run_conversion_job(
         if is_vid and q_target in QUALITY_PRESETS:
             est_bytes = item["qualities"].get(q_target, {}).get("bytes", item["orig_size"])
 
+        # Skip if already finished in checkpoint
         if fid in completed_ids and completed_ids[fid].get("quality") == q_target and final_dest.exists():
             actual_sz = final_dest.stat().st_size
             return {
@@ -456,7 +475,7 @@ def run_conversion_job(
             }
 
         with JOBS_LOCK:
-            ACTIVE_JOBS[job_id]["current_file"] = f"{item['name']} ({q_target})"
+            ACTIVE_JOBS[job_id]["current_file"] = f"Starting: {item['name']} ({q_target})"
 
         _, _, free_b = shutil.disk_usage(WORK_DIR)
         if free_b < 1.5 * (1024 ** 3):
@@ -467,7 +486,7 @@ def run_conversion_job(
 
         action_label = "copied original"
         if not is_vid or q_target == "Original":
-            download_drive_file(item, final_dest, headers, base_params)
+            download_drive_file(item, final_dest, headers, base_params, job_id=job_id)
         else:
             q_info = item["qualities"].get(q_target, {})
             needs_transcode = not q_info.get("is_copy", False)
@@ -475,9 +494,9 @@ def run_conversion_job(
             tmp_src = tmp_tree / f"{fid}_raw"
             tmp_out = tmp_tree / f"{fid}_conv.mp4"
             try:
-                download_drive_file(item, tmp_src, headers, base_params)
+                download_drive_file(item, tmp_src, headers, base_params, job_id=job_id)
                 if needs_transcode:
-                    convert_video_ffmpeg(tmp_src, tmp_out, q_target)
+                    convert_video_ffmpeg(tmp_src, tmp_out, q_target, job_id=job_id, file_name=item["name"])
                     if tmp_out.stat().st_size < tmp_src.stat().st_size:
                         shutil.move(str(tmp_out), str(final_dest))
                         action_label = f"converted to {q_target}"
@@ -509,7 +528,8 @@ def run_conversion_job(
             "skipped": False,
         }
 
-    with ThreadPoolExecutor(max_workers=2) as pool:
+    # Run files in sequence with all 4 CPU cores dedicated per video for max single-file speed
+    with ThreadPoolExecutor(max_workers=1) as pool:
         futures = {pool.submit(process_one_item, it): it for it in all_items}
         for fut in as_completed(futures):
             f_meta = futures[fut]
@@ -545,13 +565,13 @@ class StartJobRequest(BaseModel):
 
 @app.get("/")
 def root():
-    return {"service": "DriveZip Pro Cloud Backend", "milestone": 3, "status": "online", "gpu": HAS_GPU}
+    return {"service": "DriveZip Pro Cloud Backend", "milestone": 3.1, "status": "online", "gpu": HAS_GPU}
 
 
 @app.get("/api/v1/health")
 def health(_: bool = Depends(verify_key)):
     total, used, free = shutil.disk_usage(WORK_DIR)
-    return {"authenticated": True, "milestone": 3, "disk_free_gb": round(free / (1024 ** 3), 2), "gpu": HAS_GPU}
+    return {"authenticated": True, "milestone": 3.1, "disk_free_gb": round(free / (1024 ** 3), 2), "gpu": HAS_GPU}
 
 
 @app.post("/api/v1/inspect")
@@ -585,7 +605,7 @@ def start_job(req: StartJobRequest, _: bool = Depends(verify_key)):
             "state": "STARTING",
             "processed_files": 0,
             "total_files": scan_data["total_files"],
-            "current_file": "Starting parallel FFmpeg workers...",
+            "current_file": "Starting FFmpeg conversion across 4 CPU cores...",
             "estimated_total_bytes": est_total,
             "actual_bytes_so_far": 0,
             "file_results": [],
