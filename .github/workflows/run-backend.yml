@@ -37,7 +37,7 @@ jobs:
 
       - name: Start FastAPI & Publish Live Tunnel URL
         run: |
-          nohup ./venv/bin/uvicorn backend.app:app --host 127.0.0.1 --port 8000 > server.log 2>&1 &
+          nohup ./venv/bin/uvicorn app:app --app-dir backend --host 127.0.0.1 --port 8000 > server.log 2>&1 &
           sleep 3
           rm -f tunnel.log
           nohup ./cloudflared tunnel --url http://127.0.0.1:8000 --logfile tunnel.log > /dev/null 2>&1 &
