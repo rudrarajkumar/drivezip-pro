@@ -60,7 +60,17 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.7'
+          
+      - name: Restore Permanent Debug Keystore
+        run: |
+          mkdir -p ~/.android
+          if [ -f keystore.b64 ]; then
+            base64 -d keystore.b64 > ~/.android/debug.keystore
+          fi
 
+      - name: Build Debug APK
+        run: ./gradlew assembleDebug
+        
       - name: Build Debug APK
         run: gradle assembleDebug --no-daemon
 
