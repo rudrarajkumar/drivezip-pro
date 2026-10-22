@@ -14,7 +14,7 @@ from fastapi import FastAPI, Header, HTTPException, Depends, Request
 from fastapi.responses import FileResponse, StreamingResponse, Response
 from pydantic import BaseModel
 
-app = FastAPI(title="DriveZip Pro Cloud Backend", version="9.0.0")
+app = FastAPI(title="DriveZip Pro Cloud Backend", version="9.1.0")
 
 BACKEND_API_KEY = os.environ.get("BACKEND_API_KEY", "drivezip2026secret")
 WORK_DIR = Path("/tmp/drivezip_jobs")
@@ -44,24 +44,6 @@ def verify_key(x_backend_key: str = Header(default="")):
     return True
 
 
-def detect_gpu() -> bool:
-    try:
-        out = subprocess.check_output(
-            ["ffmpeg", "-hide_banner", "-encoders"],
-            stderr=subprocess.STDOUT,
-            text=True,
-            timeout=10,
-        )
-        if "h264_nvenc" not in out:
-            return False
-        return subprocess.run(["nvidia-smi"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
-    except Exception:
-        return False
-
-
-HAS_GPU = detect_gpu()
-
-
 def sanitize_filename(name: str) -> str:
     cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip()
     return cleaned if cleaned else "unnamed_file"
@@ -88,7 +70,6 @@ def build_drive_auth(oauth_token: str, api_key: str):
     params = {
         "supportsAllDrives": "true",
         "includeItemsFromAllDrives": "true",
-        "corpora": "allDrives",
     }
     if oauth_token.strip():
         headers["Authorization"] = f"Bearer {oauth_token.strip()}"
@@ -97,7 +78,7 @@ def build_drive_auth(oauth_token: str, api_key: str):
     else:
         raise HTTPException(
             status_code=400,
-            detail="Missing Google Auth! Since this folder is 'Shared with you', you MUST Sign In with Google on Tab 2.",
+            detail="Missing Google Auth! Sign In with Google on Tab 2.",
         )
     return headers, params
 
@@ -108,10 +89,7 @@ def drive_api_get(client: httpx.Client, url: str, headers: dict, params: dict) -
         if resp.status_code == 200:
             return resp.json()
         if resp.status_code == 401:
-            raise HTTPException(
-                status_code=401,
-                detail="Google OAuth Token expired (HTTP 401). Please go to Tab 2 and tap Sign In with Google again.",
-            )
+            raise HTTPException(status_code=401, detail="Google OAuth Token expired. Re-sign in on Tab 2.")
         if resp.status_code in (429, 500, 502, 503, 504):
             time.sleep(1.5 * (attempt + 1))
             continue
@@ -361,7 +339,7 @@ def download_drive_file_with_progress(
         with httpx.Client(follow_redirects=True, timeout=180.0) as client:
             with client.stream("GET", url, headers=headers, params=params) as resp:
                 if resp.status_code == 401:
-                    raise RuntimeError("HTTP 401: Google OAuth Token expired. Please go to Tab 2 and re-sign in.")
+                    raise RuntimeError("HTTP 401: Google OAuth Token expired. Re-sign in on Tab 2.")
                 if resp.status_code == 200:
                     downloaded = 0
                     last_tick = 0.0
@@ -384,7 +362,7 @@ def download_drive_file_with_progress(
                                     item_idx,
                                     total_items,
                                     item_frac,
-                                    f"[{item_idx}/{total_items}] 📥 Cloud Downloading from Drive: {dl_mb:.1f} / {tot_mb:.1f} MB ({pct}%) — {file_info['name']}",
+                                    f"[{item_idx}/{total_items}] 📥 Cloud Downloading: {dl_mb:.1f} / {tot_mb:.1f} MB ({pct}%) — {file_info['name']}",
                                 )
                     return
                 if resp.status_code in (429, 500, 502, 503, 504):
@@ -415,7 +393,7 @@ def convert_video_ffmpeg_with_progress(
         item_idx,
         total_items,
         0.31,
-        f"[{item_idx}/{total_items}] ⚙️ Starting 4-CPU FFmpeg ({target_quality}): 0% — {file_name}",
+        f"[{item_idx}/{total_items}] ⚙️ Starting FFmpeg ({target_quality}): 0% — {file_name}",
     )
 
     v_codec = [
@@ -473,12 +451,12 @@ def convert_video_ffmpeg_with_progress(
                             item_idx,
                             total_items,
                             item_frac,
-                            f"[{item_idx}/{total_items}] ⚙️ FFmpeg Encoding {target_quality}: {pct}%{spd_info} ({fmt_hms(cur_sec)} / {fmt_hms(total_sec)}) — {file_name}",
+                            f"[{item_idx}/{total_items}] ⚙️ FFmpeg Encoding: {pct}%{spd_info} ({fmt_hms(cur_sec)} / {fmt_hms(total_sec)}) — {file_name}",
                         )
 
     proc.wait()
     if proc.returncode != 0:
-        err_txt = proc.stderr.read() if proc.stderr else "Unknown FFmpeg error"
+        err_txt = proc.stderr.read() if proc.stderr else "Unknown error"
         raise RuntimeError(f"FFmpeg error: {err_txt[-300:]}")
 
 
@@ -525,7 +503,7 @@ def run_conversion_and_zip_job(
         if job_id in CANCEL_FLAGS:
             with JOBS_LOCK:
                 ACTIVE_JOBS[job_id]["state"] = "FAILED"
-                ACTIVE_JOBS[job_id]["current_file"] = "🛑 Job cancelled by user."
+                ACTIVE_JOBS[job_id]["current_file"] = "🛑 Cancelled by user."
             return
 
         fid = item["id"]
@@ -556,7 +534,7 @@ def run_conversion_and_zip_job(
                 }
             else:
                 if not item.get("can_download", True):
-                    raise RuntimeError(f"Download restricted by file owner: {item['name']}")
+                    raise RuntimeError(f"Download restricted: {item['name']}")
 
                 if not is_vid or q_target == "Original":
                     download_drive_file_with_progress(
@@ -619,16 +597,12 @@ def run_conversion_and_zip_job(
         with JOBS_LOCK:
             ACTIVE_JOBS[job_id]["state"] = "PACKAGING_ZIP"
             ACTIVE_JOBS[job_id]["overall_percent"] = 99.5
-            ACTIVE_JOBS[job_id]["current_file"] = f"📦 Packaging unified ZIP64 archive ({zip_filename})..."
+            ACTIVE_JOBS[job_id]["current_file"] = f"📦 Packaging ZIP64 archive..."
 
         all_converted_files = [p for p in out_tree.rglob("*") if p.is_file()]
         with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
             for f_idx, f_path in enumerate(all_converted_files, start=1):
                 arcname = str(f_path.relative_to(out_tree))
-                with JOBS_LOCK:
-                    ACTIVE_JOBS[job_id]["current_file"] = (
-                        f"📦 Adding to ZIP64 ({f_idx}/{len(all_converted_files)}): {arcname}"
-                    )
                 zf.write(f_path, arcname)
                 f_path.unlink(missing_ok=True)
 
@@ -639,13 +613,11 @@ def run_conversion_and_zip_job(
             ACTIVE_JOBS[job_id]["zip_ready"] = True
             ACTIVE_JOBS[job_id]["zip_filename"] = zip_filename
             ACTIVE_JOBS[job_id]["zip_size_bytes"] = zip_final_bytes
-            ACTIVE_JOBS[job_id]["current_file"] = (
-                f"✅ ZIP64 Ready ({round(zip_final_bytes / (1024 * 1024), 1)} MB)! Tap Download Final ZIP below."
-            )
+            ACTIVE_JOBS[job_id]["current_file"] = f"✅ ZIP64 Ready! Tap Download Final ZIP below."
     except Exception as e:
         with JOBS_LOCK:
             ACTIVE_JOBS[job_id]["state"] = "FAILED"
-            ACTIVE_JOBS[job_id]["errors"].append(f"ZIP packaging error: {str(e)}")
+            ACTIVE_JOBS[job_id]["errors"].append(f"ZIP error: {str(e)}")
 
 
 class InspectRequest(BaseModel):
@@ -664,13 +636,13 @@ class StartJobRequest(BaseModel):
 
 @app.get("/")
 def root():
-    return {"service": "DriveZip Pro Cloud Backend", "milestone": 9, "status": "online", "gpu": HAS_GPU}
+    return {"service": "DriveZip Pro Cloud Backend", "milestone": 9.1, "status": "online"}
 
 
 @app.get("/api/v1/health")
 def health(_: bool = Depends(verify_key)):
-    total, used, free = shutil.disk_usage(WORK_DIR)
-    return {"authenticated": True, "milestone": 9, "disk_free_gb": round(free / (1024 ** 3), 2), "gpu": HAS_GPU}
+    _, _, free = shutil.disk_usage(WORK_DIR)
+    return {"authenticated": True, "milestone": 9.1, "disk_free_gb": round(free / (1024 ** 3), 2)}
 
 
 @app.post("/api/v1/inspect")
@@ -695,7 +667,7 @@ def cancel_job(job_id: str, _: bool = Depends(verify_key)):
         if job_id in ACTIVE_JOBS:
             ACTIVE_JOBS[job_id]["state"] = "FAILED"
             ACTIVE_JOBS[job_id]["current_file"] = "🛑 Cancelled by user."
-    return {"cancelled": True, "job_id": job_id}
+    return {"cancelled": True}
 
 
 @app.post("/api/v1/jobs/cleanup")
@@ -736,7 +708,7 @@ def start_job(req: StartJobRequest, _: bool = Depends(verify_key)):
             "processed_files": 0,
             "total_files": scan_data["total_files"],
             "overall_percent": 0.0,
-            "current_file": "Initializing cloud download & FFmpeg pipeline...",
+            "current_file": "Initializing...",
             "estimated_total_bytes": est_total,
             "actual_bytes_so_far": 0,
             "file_results": [],
@@ -774,12 +746,12 @@ def download_job_zip(
 
     with JOBS_LOCK:
         if job_id not in ACTIVE_JOBS or not ACTIVE_JOBS[job_id].get("zip_ready", False):
-            raise HTTPException(status_code=400, detail="ZIP archive is not ready yet.")
+            raise HTTPException(status_code=400, detail="ZIP not ready.")
         zip_name = ACTIVE_JOBS[job_id]["zip_filename"]
 
     zip_path = WORK_DIR / job_id / zip_name
     if not zip_path.exists():
-        raise HTTPException(status_code=404, detail="ZIP file not found on cloud disk.")
+        raise HTTPException(status_code=404, detail="ZIP file not found.")
 
     file_size = zip_path.stat().st_size
     range_header = request.headers.get("range")
@@ -790,9 +762,6 @@ def download_job_zip(
             start = int(m.group(1))
             end = int(m.group(2)) if m.group(2) else file_size - 1
             end = min(end, file_size - 1)
-            if start >= file_size:
-                return Response(status_code=416, headers={"Content-Range": f"bytes */{file_size}"})
-
             length = end - start + 1
 
             def iter_range():
@@ -814,9 +783,4 @@ def download_job_zip(
             }
             return StreamingResponse(iter_range(), status_code=206, headers=headers, media_type="application/zip")
 
-    return FileResponse(
-        zip_path,
-        media_type="application/zip",
-        filename=zip_name,
-        headers={"Accept-Ranges": "bytes"},
-    )
+    return FileResponse(zip_path, media_type="application/zip", filename=zip_name, headers={"Accept-Ranges": "bytes"})
