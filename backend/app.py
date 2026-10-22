@@ -4,25 +4,27 @@ import json
 import time
 import shutil
 import subprocess
+import threading
 from pathlib import Path
 from typing import Dict, List, Set, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Depends
 from pydantic import BaseModel
 
-app = FastAPI(title="DriveZip Pro Cloud Backend", version="2.0.0")
+app = FastAPI(title="DriveZip Pro Cloud Backend", version="3.0.0")
 
 BACKEND_API_KEY = os.environ.get("BACKEND_API_KEY", "drivezip2026secret")
 WORK_DIR = Path("/tmp/drivezip_jobs")
 WORK_DIR.mkdir(parents=True, exist_ok=True)
 
-# Standard bitrate presets: target height, video bitrate (kbps), audio bitrate (kbps)
+# YouTube-grade lecture bitrates: target height, video bitrate (kbps), audio bitrate (kbps)
 QUALITY_PRESETS = {
-    "480p": {"height": 480, "v_kbps": 750, "a_kbps": 96},
-    "360p": {"height": 360, "v_kbps": 420, "a_kbps": 96},
-    "240p": {"height": 240, "v_kbps": 240, "a_kbps": 64},
-    "144p": {"height": 144, "v_kbps": 130, "a_kbps": 64},
+    "480p": {"height": 480, "v_kbps": 400, "a_kbps": 64},
+    "360p": {"height": 360, "v_kbps": 220, "a_kbps": 64},
+    "240p": {"height": 240, "v_kbps": 135, "a_kbps": 48},
+    "144p": {"height": 144, "v_kbps": 80,  "a_kbps": 48},
 }
 
 WORKSPACE_EXPORTS = {
@@ -31,11 +33,32 @@ WORKSPACE_EXPORTS = {
     "application/vnd.google-apps.presentation": ("application/pdf", ".pdf"),
 }
 
+JOBS_LOCK = threading.Lock()
+ACTIVE_JOBS: Dict[str, dict] = {}
+
 
 def verify_key(x_backend_key: str = Header(default="")):
     if x_backend_key != BACKEND_API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized: Invalid X-Backend-Key")
     return True
+
+
+def detect_gpu() -> bool:
+    try:
+        out = subprocess.check_output(
+            ["ffmpeg", "-hide_banner", "-encoders"],
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=10,
+        )
+        if "h264_nvenc" not in out:
+            return False
+        return subprocess.run(["nvidia-smi"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+    except Exception:
+        return False
+
+
+HAS_GPU = detect_gpu()
 
 
 def sanitize_filename(name: str) -> str:
@@ -123,18 +146,16 @@ def calculate_video_estimates(orig_size: int, width: int, height: int, duration_
     for q_name, preset in QUALITY_PRESETS.items():
         target_h = preset["height"]
         if short_side <= target_h:
-            # Never upscale: copy original as-is
             estimates[q_name] = {"bytes": orig_size, "is_copy": True, "label": "copy (<= target)"}
         else:
             if duration_ms > 0:
                 total_kbps = preset["v_kbps"] + preset["a_kbps"]
-                est_bytes = int((total_kbps * 1000 / 8.0) * dur_sec * 1.03)
+                est_bytes = int((total_kbps * 1000 / 8.0) * dur_sec * 1.02)
             else:
-                ratio = (target_h / float(max(short_side, target_h))) ** 1.35
+                ratio = (target_h / float(max(short_side, target_h))) ** 1.45
                 est_bytes = int(orig_size * ratio)
 
             if est_bytes >= orig_size:
-                # Never exceed original size
                 estimates[q_name] = {"bytes": orig_size, "is_copy": True, "label": "copy (smaller orig)"}
             else:
                 estimates[q_name] = {"bytes": max(est_bytes, 64 * 1024), "is_copy": False, "label": "estimated"}
@@ -157,7 +178,6 @@ def scan_drive_recursive(resource_id: str, oauth_token: str, api_key: str) -> di
             {**base_params, "fields": fields_single},
         )
 
-        # Resolve shortcut if root link points to a shortcut
         if root_meta.get("mimeType") == "application/vnd.google-apps.shortcut":
             target_id = root_meta.get("shortcutDetails", {}).get("targetId")
             if target_id:
@@ -174,7 +194,6 @@ def scan_drive_recursive(resource_id: str, oauth_token: str, api_key: str) -> di
         def process_item(item: dict, rel_folder: str, seen_names: Set[str]):
             mime = item.get("mimeType", "")
 
-            # Resolve shortcut inside folder
             if mime == "application/vnd.google-apps.shortcut":
                 t_id = item.get("shortcutDetails", {}).get("targetId")
                 if not t_id:
@@ -190,7 +209,6 @@ def scan_drive_recursive(resource_id: str, oauth_token: str, api_key: str) -> di
                 except Exception:
                     return
 
-            # If subfolder, recurse while preserving relative folder structure
             if mime == "application/vnd.google-apps.folder":
                 sub_name = sanitize_filename(item.get("name", "Subfolder"))
                 next_rel = f"{rel_folder}/{sub_name}" if rel_folder else sub_name
@@ -203,7 +221,6 @@ def scan_drive_recursive(resource_id: str, oauth_token: str, api_key: str) -> di
             if is_workspace and not raw_name.lower().endswith(export_ext):
                 raw_name += export_ext
 
-            # Deduplicate identical filenames within the same folder
             base, ext = os.path.splitext(raw_name)
             unique_name = raw_name
             counter = 1
@@ -301,24 +318,297 @@ def scan_drive_recursive(resource_id: str, oauth_token: str, api_key: str) -> di
     }
 
 
+def download_drive_file(file_info: dict, dest_path: Path, headers: dict, base_params: dict):
+    fid = file_info["id"]
+    if file_info.get("is_workspace", False):
+        url = f"https://www.googleapis.com/drive/v3/files/{fid}/export"
+        params = {**base_params, "mimeType": file_info.get("export_mime", "application/pdf")}
+    else:
+        url = f"https://www.googleapis.com/drive/v3/files/{fid}"
+        params = {**base_params, "alt": "media", "acknowledgeAbuse": "true"}
+
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    for attempt in range(4):
+        with httpx.Client(follow_redirects=True, timeout=120.0) as client:
+            with client.stream("GET", url, headers=headers, params=params) as resp:
+                if resp.status_code == 200:
+                    with open(dest_path, "wb") as f:
+                        for chunk in resp.iter_bytes(chunk_size=1024 * 512):
+                            f.write(chunk)
+                    return
+                if resp.status_code in (429, 500, 502, 503, 504):
+                    time.sleep(2.0 * (attempt + 1))
+                    continue
+                raise RuntimeError(f"HTTP {resp.status_code} downloading {file_info['name']}")
+    raise RuntimeError(f"Download failed after retries: {file_info['name']}")
+
+
+def convert_video_ffmpeg(src_path: Path, dst_path: Path, target_quality: str):
+    preset = QUALITY_PRESETS[target_quality]
+    h = preset["height"]
+    v_kbps = preset["v_kbps"]
+    a_kbps = preset["a_kbps"]
+
+    # Scale height to target without upscaling; keep width divisible by 2
+    scale_filter = f"scale=-2:'min(ih,{h})'"
+    if HAS_GPU:
+        v_codec = [
+            "-c:v", "h264_nvenc",
+            "-preset", "p4",
+            "-b:v", f"{v_kbps}k",
+            "-maxrate", f"{int(v_kbps * 1.2)}k",
+            "-bufsize", f"{v_kbps * 2}k",
+        ]
+    else:
+        v_codec = [
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-tune", "stillimage",
+            "-crf", "30",
+            "-b:v", f"{v_kbps}k",
+            "-maxrate", f"{int(v_kbps * 1.15)}k",
+            "-bufsize", f"{v_kbps * 2}k",
+            "-threads", "2",
+        ]
+
+    cmd = [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "-i", str(src_path),
+        "-vf", scale_filter,
+        *v_codec,
+        "-c:a", "aac", "-b:a", f"{a_kbps}k", "-ac", "1",
+        "-movflags", "+faststart",
+        str(dst_path),
+    ]
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    if res.returncode != 0:
+        raise RuntimeError(f"FFmpeg error: {res.stderr[-300:]}")
+
+
+def run_conversion_job(
+    job_id: str,
+    scan_data: dict,
+    bulk_quality: str,
+    video_overrides: Dict[str, str],
+    oauth_token: str,
+    api_key: str,
+):
+    job_dir = WORK_DIR / job_id
+    out_tree = job_dir / "converted_files"
+    tmp_tree = job_dir / "tmp_downloads"
+    ckpt_file = job_dir / "checkpoint.json"
+
+    for d in (out_tree, tmp_tree):
+        d.mkdir(parents=True, exist_ok=True)
+
+    completed_ids = {}
+    if ckpt_file.exists():
+        try:
+            completed_ids = json.loads(ckpt_file.read_text())
+        except Exception:
+            completed_ids = {}
+
+    headers, base_params = build_drive_auth(oauth_token, api_key)
+
+    all_items = []
+    for d in scan_data["documents"]:
+        all_items.append({**d, "is_video": False, "target_quality": "Original"})
+    for v in scan_data["videos"]:
+        q_target = video_overrides.get(v["id"], bulk_quality)
+        if q_target == "SKIP":
+            continue
+        all_items.append({**v, "is_video": True, "target_quality": q_target})
+
+    with JOBS_LOCK:
+        ACTIVE_JOBS[job_id]["total_files"] = len(all_items)
+        ACTIVE_JOBS[job_id]["state"] = "CONVERTING"
+
+    def process_one_item(item: dict):
+        fid = item["id"]
+        rel_path = item["rel_path"]
+        is_vid = item["is_video"]
+        q_target = item["target_quality"]
+
+        if is_vid and q_target != "Original":
+            base_no_ext, _ = os.path.splitext(rel_path)
+            final_rel = f"{base_no_ext}.mp4"
+        else:
+            final_rel = rel_path
+
+        final_dest = out_tree / final_rel
+        final_dest.parent.mkdir(parents=True, exist_ok=True)
+
+        est_bytes = item["orig_size"]
+        if is_vid and q_target in QUALITY_PRESETS:
+            est_bytes = item["qualities"].get(q_target, {}).get("bytes", item["orig_size"])
+
+        # Checkpointing: Skip if already processed at the same quality
+        if fid in completed_ids and completed_ids[fid].get("quality") == q_target and final_dest.exists():
+            actual_sz = final_dest.stat().st_size
+            return {
+                "id": fid,
+                "name": item["name"],
+                "rel_path": final_rel,
+                "is_video": is_vid,
+                "quality": q_target,
+                "orig_bytes": item["orig_size"],
+                "estimated_bytes": est_bytes,
+                "actual_bytes": actual_sz,
+                "action": "cached (checkpoint)",
+                "skipped": True,
+            }
+
+        with JOBS_LOCK:
+            ACTIVE_JOBS[job_id]["current_file"] = f"{item['name']} ({q_target})"
+
+        _, _, free_b = shutil.disk_usage(WORK_DIR)
+        if free_b < 1.5 * (1024 ** 3):
+            raise RuntimeError("Cloud server disk space low (<1.5 GB free).")
+
+        if not item.get("can_download", True):
+            raise RuntimeError(f"Download restricted by file owner: {item['name']}")
+
+        action_label = "copied original"
+        if not is_vid or q_target == "Original":
+            download_drive_file(item, final_dest, headers, base_params)
+        else:
+            q_info = item["qualities"].get(q_target, {})
+            needs_transcode = not q_info.get("is_copy", False)
+
+            tmp_src = tmp_tree / f"{fid}_raw"
+            tmp_out = tmp_tree / f"{fid}_conv.mp4"
+            try:
+                download_drive_file(item, tmp_src, headers, base_params)
+                if needs_transcode:
+                    convert_video_ffmpeg(tmp_src, tmp_out, q_target)
+                    # Never exceed original size: keep smaller file
+                    if tmp_out.stat().st_size < tmp_src.stat().st_size:
+                        shutil.move(str(tmp_out), str(final_dest))
+                        action_label = f"converted to {q_target}"
+                    else:
+                        shutil.move(str(tmp_src), str(final_dest))
+                        action_label = "kept original (smaller than transcode)"
+                else:
+                    shutil.move(str(tmp_src), str(final_dest))
+                    action_label = "copied (<= target resolution)"
+            finally:
+                tmp_src.unlink(missing_ok=True)
+                tmp_out.unlink(missing_ok=True)
+
+        actual_sz = final_dest.stat().st_size
+        with JOBS_LOCK:
+            completed_ids[fid] = {"quality": q_target, "actual_bytes": actual_sz}
+            ckpt_file.write_text(json.dumps(completed_ids))
+
+        return {
+            "id": fid,
+            "name": item["name"],
+            "rel_path": final_rel,
+            "is_video": is_vid,
+            "quality": q_target,
+            "orig_bytes": item["orig_size"],
+            "estimated_bytes": est_bytes,
+            "actual_bytes": actual_sz,
+            "action": action_label,
+            "skipped": False,
+        }
+
+    # Process 2 files in parallel (2 workers * 2 FFmpeg threads = 4 CPU cores on GitHub VM)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = {pool.submit(process_one_item, it): it for it in all_items}
+        for fut in as_completed(futures):
+            f_meta = futures[fut]
+            try:
+                res = fut.result()
+                with JOBS_LOCK:
+                    ACTIVE_JOBS[job_id]["processed_files"] += 1
+                    ACTIVE_JOBS[job_id]["actual_bytes_so_far"] += res["actual_bytes"]
+                    ACTIVE_JOBS[job_id]["file_results"].append(res)
+            except Exception as e:
+                with JOBS_LOCK:
+                    ACTIVE_JOBS[job_id]["processed_files"] += 1
+                    ACTIVE_JOBS[job_id]["errors"].append(f"{f_meta['name']}: {str(e)}")
+
+    with JOBS_LOCK:
+        ACTIVE_JOBS[job_id]["state"] = "COMPLETED"
+        ACTIVE_JOBS[job_id]["current_file"] = "All files converted and verified!"
+
+
 class InspectRequest(BaseModel):
     drive_link: str
     oauth_token: str = ""
     api_key: str = ""
 
 
+class StartJobRequest(BaseModel):
+    drive_link: str
+    bulk_quality: str = "360p"
+    video_overrides: Dict[str, str] = {}
+    oauth_token: str = ""
+    api_key: str = ""
+
+
 @app.get("/")
 def root():
-    return {"service": "DriveZip Pro Cloud Backend", "milestone": 2, "status": "online"}
+    return {"service": "DriveZip Pro Cloud Backend", "milestone": 3, "status": "online", "gpu": HAS_GPU}
 
 
 @app.get("/api/v1/health")
 def health(_: bool = Depends(verify_key)):
     total, used, free = shutil.disk_usage(WORK_DIR)
-    return {"authenticated": True, "milestone": 2, "disk_free_gb": round(free / (1024 ** 3), 2)}
+    return {"authenticated": True, "milestone": 3, "disk_free_gb": round(free / (1024 ** 3), 2), "gpu": HAS_GPU}
 
 
 @app.post("/api/v1/inspect")
 def inspect_resource(req: InspectRequest, _: bool = Depends(verify_key)):
     resource_id = extract_drive_id(req.drive_link)
     return scan_drive_recursive(resource_id, req.oauth_token, req.api_key)
+
+
+@app.post("/api/v1/jobs/start")
+def start_job(req: StartJobRequest, _: bool = Depends(verify_key)):
+    resource_id = extract_drive_id(req.drive_link)
+    scan_data = scan_drive_recursive(resource_id, req.oauth_token, req.api_key)
+    job_id = f"{resource_id}_{req.bulk_quality}"
+
+    with JOBS_LOCK:
+        if job_id in ACTIVE_JOBS and ACTIVE_JOBS[job_id]["state"] == "CONVERTING":
+            return ACTIVE_JOBS[job_id]
+
+        est_v_bytes = 0
+        for v in scan_data["videos"]:
+            q_target = req.video_overrides.get(v["id"], req.bulk_quality)
+            if q_target != "SKIP":
+                est_v_bytes += v["qualities"].get(q_target, {}).get("bytes", v["orig_size"])
+
+        est_total = scan_data["document_total_bytes"] + est_v_bytes
+
+        ACTIVE_JOBS[job_id] = {
+            "job_id": job_id,
+            "title": scan_data["title"],
+            "bulk_quality": req.bulk_quality,
+            "state": "STARTING",
+            "processed_files": 0,
+            "total_files": scan_data["total_files"],
+            "current_file": "Starting parallel FFmpeg workers...",
+            "estimated_total_bytes": est_total,
+            "actual_bytes_so_far": 0,
+            "file_results": [],
+            "errors": [],
+        }
+
+    threading.Thread(
+        target=run_conversion_job,
+        args=(job_id, scan_data, req.bulk_quality, req.video_overrides, req.oauth_token, req.api_key),
+        daemon=True,
+    ).start()
+
+    return ACTIVE_JOBS[job_id]
+
+
+@app.get("/api/v1/jobs/{job_id}/status")
+def get_job_status(job_id: str, _: bool = Depends(verify_key)):
+    with JOBS_LOCK:
+        if job_id not in ACTIVE_JOBS:
+            raise HTTPException(status_code=404, detail="Job ID not found")
+        return ACTIVE_JOBS[job_id]
