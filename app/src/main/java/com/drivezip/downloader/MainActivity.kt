@@ -10,12 +10,15 @@ import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
+import android.os.StatFs
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -43,6 +46,7 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
 import org.json.JSONObject
 import java.net.InetAddress
 import java.security.MessageDigest
@@ -55,7 +59,7 @@ class MainActivity : ComponentActivity() {
         setContent {
             MaterialTheme {
                 Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-                    MilestoneOneScreen()
+                    MilestoneTwoScreen()
                 }
             }
         }
@@ -79,7 +83,6 @@ fun getSecurePrefs(context: Context): SharedPreferences {
     }
 }
 
-// Built-in Google DNS-over-HTTPS (8.8.8.8) fallback so Jio ISP never blocks .trycloudflare.com
 object JioSafeDns : Dns {
     override fun lookup(hostname: String): List<InetAddress> {
         return try {
@@ -119,41 +122,61 @@ fun buildHttpClient(): OkHttpClient {
     return OkHttpClient.Builder()
         .dns(JioSafeDns)
         .connectTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(60, TimeUnit.SECONDS)
+        .readTimeout(90, TimeUnit.SECONDS)
         .build()
 }
 
-data class QualityOption(
-    val quality: String,
+data class QualityEstimate(
     val bytes: Long,
     val isCopy: Boolean,
     val label: String
 )
 
-data class SingleInspectResult(
-    val resourceId: String,
+data class DocumentItem(
+    val id: String,
     val name: String,
+    val relPath: String,
     val mimeType: String,
-    val isFolder: Boolean,
-    val isVideo: Boolean,
-    val isPdfOrDoc: Boolean,
-    val origSizeBytes: Long,
+    val origSize: Long,
+    val isWorkspace: Boolean,
+    val canDownload: Boolean
+)
+
+data class VideoItem(
+    val id: String,
+    val name: String,
+    val relPath: String,
+    val origSize: Long,
     val width: Int,
     val height: Int,
     val durationSec: Int,
     val canDownload: Boolean,
-    val qualities: List<QualityOption>
+    val qualities: Map<String, QualityEstimate>
+)
+
+data class FolderScanSummary(
+    val resourceId: String,
+    val title: String,
+    val isFolder: Boolean,
+    val totalFiles: Int,
+    val documentCount: Int,
+    val documentTotalBytes: Long,
+    val videoCount: Int,
+    val videoTotalDurationSec: Int,
+    val videoQualityTotals: Map<String, Long>,
+    val documents: List<DocumentItem>,
+    val videos: List<VideoItem>
 )
 
 @Composable
-fun MilestoneOneScreen() {
+fun MilestoneTwoScreen() {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val prefs = remember { getSecurePrefs(context) }
 
     var selectedTab by remember { mutableStateOf(0) }
 
-    // Applied (Active) Settings vs Draft Input States so every setting has an explicit Apply button
+    // Applied vs Draft Settings (Every setting has its own explicit Apply button)
     var appliedGhRepo by remember { mutableStateOf(prefs.getString("gh_repo", "rudrarajkumar/drivezip-pro") ?: "rudrarajkumar/drivezip-pro") }
     var draftGhRepo by remember { mutableStateOf(appliedGhRepo) }
 
@@ -176,14 +199,22 @@ fun MilestoneOneScreen() {
     var pendingAccount by remember { mutableStateOf<Account?>(null) }
 
     var driveLinkInput by remember { mutableStateOf("") }
-    var draftQualityChoice by remember { mutableStateOf("360p") }
-    var appliedQualityChoice by remember { mutableStateOf("360p") }
+    var folderSummary by remember { mutableStateOf<FolderScanSummary?>(null) }
 
-    var inspectResult by remember { mutableStateOf<SingleInspectResult?>(null) }
+    // Bulk quality selection (Draft vs Applied)
+    var draftBulkQuality by remember { mutableStateOf("360p") }
+    var appliedBulkQuality by remember { mutableStateOf("360p") }
+
+    // Optional per-video quality overrides (Draft vs Applied)
+    var draftVideoOverrides by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
+    var appliedVideoOverrides by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
+
+    var showPdfsSection by remember { mutableStateOf(true) }
+    var showVideosSection by remember { mutableStateOf(true) }
+
     var isBusy by remember { mutableStateOf(false) }
-    var statusBanner by remember { mutableStateOf("Ready. Configure Backend & Auth in Tab 2 or paste a Google Drive link.") }
+    var statusBanner by remember { mutableStateOf("Ready. Paste a Google Drive folder or file link below.") }
 
-    // Launcher for Google Drive OAuth Consent Screen (Fixes the null-safety crash at line 215)
     val recoveryLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartActivityForResult()
     ) { result ->
@@ -202,7 +233,7 @@ fun MilestoneOneScreen() {
                             draftOauthToken = token
                             prefs.edit().putString("oauth_token", token).apply()
                             statusBanner = "Google Drive Permission Granted! OAuth Token Applied."
-                            Toast.makeText(context, "Google Drive Authorized & Applied!", Toast.LENGTH_SHORT).show()
+                            Toast.makeText(context, "Google Drive Authorized!", Toast.LENGTH_SHORT).show()
                         }
                     } catch (e: Exception) {
                         withContext(Dispatchers.Main) {
@@ -216,7 +247,6 @@ fun MilestoneOneScreen() {
         }
     }
 
-    // Launcher for Google Account Picker
     val signInLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartActivityForResult()
     ) { result ->
@@ -260,11 +290,10 @@ fun MilestoneOneScreen() {
                 }
             }
         } catch (e: Exception) {
-            statusBanner = "Google Sign-In failed (Make sure Permanent SHA-1 is saved in Google Cloud Console): ${e.message}"
+            statusBanner = "Google Sign-In failed: ${e.message}"
         }
     }
 
-    // Automatically check if GitHub has a live backend URL on startup
     LaunchedEffect(Unit) {
         if (appliedBackendUrl.isBlank()) {
             val url = fetchLiveUrlUncached(appliedGhRepo)
@@ -272,14 +301,14 @@ fun MilestoneOneScreen() {
                 appliedBackendUrl = url
                 draftBackendUrl = url
                 prefs.edit().putString("backend_url", url).apply()
-                statusBanner = "Auto-connected to GitHub Cloud Server: $url"
+                statusBanner = "Connected to GitHub Cloud Server: $url"
             }
         }
     }
 
     Column(modifier = Modifier.fillMaxSize()) {
         TabRow(selectedTabIndex = selectedTab) {
-            Tab(selected = selectedTab == 0, onClick = { selectedTab = 0 }, text = { Text("1. Link Analyzer") })
+            Tab(selected = selectedTab == 0, onClick = { selectedTab = 0 }, text = { Text("1. Folder Scanner & Summary") })
             Tab(selected = selectedTab == 1, onClick = { selectedTab = 1 }, text = { Text("2. Backend & Auth Setup") })
         }
 
@@ -291,6 +320,7 @@ fun MilestoneOneScreen() {
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
             if (selectedTab == 0) {
+                // SCANNER INPUT CARD
                 Card(modifier = Modifier.fillMaxWidth()) {
                     Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                         Row(
@@ -298,7 +328,7 @@ fun MilestoneOneScreen() {
                             horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Text("Google Drive Link Analyzer (Milestone 1)", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                            Text("Google Drive Folder & File Scanner", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
                             OutlinedButton(onClick = {
                                 scope.launch {
                                     statusBanner = "Fetching latest live backend URL from GitHub..."
@@ -310,7 +340,7 @@ fun MilestoneOneScreen() {
                                         val health = checkBackendHealth(url, appliedBackendKey)
                                         statusBanner = "Synced & Applied Live Backend: $url\n$health"
                                     } else {
-                                        statusBanner = "No live_url.txt found yet. Wake Cloud Server in Tab 2."
+                                        statusBanner = "No live_url.txt found. Wake Cloud Server in Tab 2."
                                     }
                                 }
                             }) {
@@ -320,7 +350,7 @@ fun MilestoneOneScreen() {
 
                         Text(
                             text = "Active Backend: ${if (appliedBackendUrl.isBlank()) "Not Set (Go to Tab 2)" else appliedBackendUrl}\n" +
-                                   "Active Auth: ${if (appliedOauthToken.isNotBlank()) "OAuth Token (${signedInEmail.ifBlank { "Manual" }})" else if (appliedDriveApiKey.isNotBlank()) "API Key (Public Links)" else "None (Go to Tab 2)"}",
+                                   "Active Auth: ${if (appliedOauthToken.isNotBlank()) "OAuth Token (${signedInEmail.ifBlank { "Active" }})" else if (appliedDriveApiKey.isNotBlank()) "API Key (Public Links)" else "None (Go to Tab 2)"}",
                             style = MaterialTheme.typography.bodySmall,
                             fontFamily = FontFamily.Monospace
                         )
@@ -328,7 +358,7 @@ fun MilestoneOneScreen() {
                         OutlinedTextField(
                             value = driveLinkInput,
                             onValueChange = { driveLinkInput = it.trim() },
-                            label = { Text("Paste Google Drive Video, PDF, or Folder Link") },
+                            label = { Text("Paste Google Drive Folder or File Link") },
                             modifier = Modifier.fillMaxWidth(),
                             singleLine = true
                         )
@@ -336,21 +366,23 @@ fun MilestoneOneScreen() {
                         Button(
                             onClick = {
                                 isBusy = true
-                                inspectResult = null
-                                statusBanner = "Analyzing Google Drive metadata via Cloud Backend..."
+                                folderSummary = null
+                                draftVideoOverrides = emptyMap()
+                                appliedVideoOverrides = emptyMap()
+                                statusBanner = "Scanning all subfolders recursively (PDFs + Videos)..."
                                 scope.launch {
-                                    val res = inspectSingleResource(
+                                    val res = scanFolderOrFileRecursive(
                                         rawUrl = appliedBackendUrl,
                                         backendKey = appliedBackendKey,
                                         driveLink = driveLinkInput,
                                         oauthToken = appliedOauthToken,
                                         driveApiKey = appliedDriveApiKey
                                     )
-                                    res.onSuccess { info ->
-                                        inspectResult = info
-                                        statusBanner = "Analysis complete: ${info.name}"
+                                    res.onSuccess { summary ->
+                                        folderSummary = summary
+                                        statusBanner = "Scan Complete: ${summary.title} (${summary.documentCount} PDFs/Docs, ${summary.videoCount} Videos)"
                                     }.onFailure { err ->
-                                        statusBanner = "Analysis failed: ${err.message}"
+                                        statusBanner = "Scan Error: ${err.message}"
                                     }
                                     isBusy = false
                                 }
@@ -358,7 +390,7 @@ fun MilestoneOneScreen() {
                             enabled = !isBusy && driveLinkInput.isNotBlank() && appliedBackendUrl.isNotBlank(),
                             modifier = Modifier.fillMaxWidth().height(52.dp)
                         ) {
-                            Text(if (isBusy) "Analyzing Link..." else "🔍 Analyze Link & Show Quality Options")
+                            Text(if (isBusy) "Scanning All Subfolders..." else "🔍 Scan Folder Recursively & Calculate Sizes")
                         }
 
                         Surface(
@@ -371,36 +403,55 @@ fun MilestoneOneScreen() {
                     }
                 }
 
-                inspectResult?.let { item ->
+                // SUMMARY & QUALITY TABLE CARD
+                folderSummary?.let { summary ->
+                    val qualitiesList = listOf("Original", "480p", "360p", "240p", "144p")
+
+                    // Calculate live video total taking any individual overrides into account
+                    val liveSelectedVideosBytes = summary.videos.sumOf { v ->
+                        val qOverride = draftVideoOverrides[v.id] ?: draftBulkQuality
+                        if (qOverride == "SKIP") 0L
+                        else v.qualities[qOverride]?.bytes ?: v.origSize
+                    }
+                    val liveGrandTotalBytes = summary.documentTotalBytes + liveSelectedVideosBytes
+                    val tabletFreeBytes = getTabletFreeStorageBytes()
+
                     Card(modifier = Modifier.fillMaxWidth()) {
                         Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                            val typeBadge = when {
-                                item.isVideo -> "🎬 VIDEO FILE"
-                                item.isFolder -> "📂 FOLDER"
-                                else -> "📄 PDF / DOCUMENT FILE"
-                            }
-                            Text("$typeBadge: ${item.name}", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
                             Text(
-                                text = "Drive ID: ${item.resourceId}\nMIME Type: ${item.mimeType}\nOriginal Size: ${formatSize(item.origSizeBytes)}",
-                                fontFamily = FontFamily.Monospace
+                                text = if (summary.isFolder) "📂 Folder Summary: ${summary.title}" else "📄 File Summary: ${summary.title}",
+                                style = MaterialTheme.typography.titleLarge,
+                                fontWeight = FontWeight.Bold
                             )
 
-                            if (item.isVideo) {
-                                Text(
-                                    text = "Source Resolution: ${item.width}x${item.height} (${item.height}p) | Duration: ${formatDuration(item.durationSec)}",
-                                    fontWeight = FontWeight.SemiBold
-                                )
-                                Divider()
-                                Text("Select Video Quality & Tap Apply:", fontWeight = FontWeight.Bold)
+                            Surface(
+                                color = MaterialTheme.colorScheme.secondaryContainer,
+                                shape = MaterialTheme.shapes.small,
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                    Text("• Total Files Found: ${summary.totalFiles}", fontWeight = FontWeight.Bold)
+                                    Text("• Non-Video Files (PDFs, Notes, Docs — Always Original Quality): ${summary.documentCount} files (${formatSize(summary.documentTotalBytes)})")
+                                    Text("• Lecture Videos: ${summary.videoCount} videos (Total Duration: ${formatDuration(summary.videoTotalDurationSec)})")
+                                }
+                            }
 
-                                item.qualities.forEach { qOpt ->
-                                    val isSelected = draftQualityChoice == qOpt.quality
+                            if (summary.videoCount > 0) {
+                                Divider()
+                                Text("Bulk Video Quality Table (Total Size of All ${summary.videoCount} Videos):", fontWeight = FontWeight.Bold)
+
+                                qualitiesList.forEach { qKey ->
+                                    val totalVBytes = summary.videoQualityTotals[qKey] ?: 0L
+                                    val grandForThisQ = summary.documentTotalBytes + totalVBytes
+                                    val isSelected = draftBulkQuality == qKey
+                                    val tag = if (qKey == "Original") "exact" else "estimated"
+
                                     Surface(
                                         color = if (isSelected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant,
                                         shape = MaterialTheme.shapes.small,
                                         modifier = Modifier
                                             .fillMaxWidth()
-                                            .clickable { draftQualityChoice = qOpt.quality }
+                                            .clickable { draftBulkQuality = qKey }
                                     ) {
                                         Row(
                                             modifier = Modifier.padding(12.dp).fillMaxWidth(),
@@ -410,48 +461,189 @@ fun MilestoneOneScreen() {
                                             Row(verticalAlignment = Alignment.CenterVertically) {
                                                 RadioButton(
                                                     selected = isSelected,
-                                                    onClick = { draftQualityChoice = qOpt.quality }
+                                                    onClick = { draftBulkQuality = qKey }
                                                 )
-                                                Text("${qOpt.quality} (${qOpt.label})", fontWeight = FontWeight.Bold)
+                                                Column {
+                                                    Text("$qKey - ${formatSize(totalVBytes)}", fontWeight = FontWeight.Bold)
+                                                    Text("($tag video total)", style = MaterialTheme.typography.bodySmall)
+                                                }
                                             }
-                                            Text(formatSize(qOpt.bytes), fontFamily = FontFamily.Monospace, fontWeight = FontWeight.SemiBold)
+                                            Text(
+                                                text = "Grand Total:\n${formatSize(grandForThisQ)}",
+                                                fontFamily = FontFamily.Monospace,
+                                                fontWeight = FontWeight.Bold
+                                            )
                                         }
                                     }
                                 }
 
                                 Button(
                                     onClick = {
-                                        appliedQualityChoice = draftQualityChoice
-                                        statusBanner = "Applied quality: $appliedQualityChoice for ${item.name}"
-                                        Toast.makeText(context, "Applied Quality: $appliedQualityChoice", Toast.LENGTH_SHORT).show()
+                                        appliedBulkQuality = draftBulkQuality
+                                        statusBanner = "Applied Bulk Video Quality: $appliedBulkQuality (Grand Total: ${formatSize(liveGrandTotalBytes)})"
+                                        Toast.makeText(context, "Applied Bulk Quality: $appliedBulkQuality", Toast.LENGTH_SHORT).show()
                                     },
                                     modifier = Modifier.fillMaxWidth()
                                 ) {
-                                    Text("✅ Apply Selected Quality ($draftQualityChoice) — Active: $appliedQualityChoice")
+                                    Text("✅ Apply Bulk Video Quality ($draftBulkQuality) — Active: $appliedBulkQuality")
                                 }
-                            } else if (item.isPdfOrDoc) {
-                                Surface(
-                                    color = MaterialTheme.colorScheme.secondaryContainer,
-                                    shape = MaterialTheme.shapes.small,
-                                    modifier = Modifier.fillMaxWidth()
-                                ) {
-                                    Text(
-                                        text = "📄 Non-video file (PDF / Document). Always downloads in 100% Original Quality (${formatSize(item.origSizeBytes)}).",
-                                        modifier = Modifier.padding(12.dp),
-                                        fontWeight = FontWeight.Medium
-                                    )
+                            }
+
+                            Divider()
+                            Text(
+                                text = "Live Grand Total (PDFs + Videos at $draftBulkQuality): ${formatSize(liveGrandTotalBytes)}\n" +
+                                       "Tablet Free Storage Available: ${formatSize(tabletFreeBytes)}",
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = if (liveGrandTotalBytes < tabletFreeBytes) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error
+                            )
+
+                            Surface(
+                                color = MaterialTheme.colorScheme.surfaceVariant,
+                                shape = MaterialTheme.shapes.small,
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text(
+                                    text = "✅ Final ZIP Structure Preview: Both PDFs (${summary.documentCount}) and Videos (${summary.videoCount}) will be packaged into ONE unified ZIP preserving their exact original subfolder paths (e.g. DppNotes/, notes/, videos/).\n" +
+                                           "Next up in Milestone 3 & 4: Cloud FFmpeg conversion & fast resumable ZIP download.",
+                                    modifier = Modifier.padding(12.dp),
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                            }
+                        }
+                    }
+
+                    // SEPARATED SECTION 1: PDFS & NON-VIDEO FILES
+                    Card(modifier = Modifier.fillMaxWidth()) {
+                        Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "📄 PDFs & Non-Video Files (${summary.documentCount})",
+                                    style = MaterialTheme.typography.titleMedium,
+                                    fontWeight = FontWeight.Bold
+                                )
+                                TextButton(onClick = { showPdfsSection = !showPdfsSection }) {
+                                    Text(if (showPdfsSection) "▲ Hide PDFs" else "▼ Show PDFs")
                                 }
-                            } else {
-                                Surface(
-                                    color = MaterialTheme.colorScheme.secondaryContainer,
-                                    shape = MaterialTheme.shapes.small,
-                                    modifier = Modifier.fillMaxWidth()
-                                ) {
-                                    Text(
-                                        text = "📂 Folder detected! Full recursive subfolder scan (separating PDFs and Videos) unlocks in Milestone 2.",
-                                        modifier = Modifier.padding(12.dp),
-                                        fontWeight = FontWeight.Medium
-                                    )
+                            }
+                            Text(
+                                text = "Total Size: ${formatSize(summary.documentTotalBytes)} • Always downloaded in 100% Original Quality into their original subfolder path.",
+                                style = MaterialTheme.typography.bodySmall
+                            )
+
+                            if (showPdfsSection) {
+                                Divider()
+                                if (summary.documents.isEmpty()) {
+                                    Text("No PDFs or non-video documents in this link.", style = MaterialTheme.typography.bodySmall)
+                                } else {
+                                    summary.documents.forEachIndexed { idx, doc ->
+                                        Surface(
+                                            color = MaterialTheme.colorScheme.surfaceVariant,
+                                            shape = MaterialTheme.shapes.small,
+                                            modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp)
+                                        ) {
+                                            Column(modifier = Modifier.padding(10.dp)) {
+                                                Text("${idx + 1}. ${doc.name}", fontWeight = FontWeight.SemiBold)
+                                                Text(
+                                                    text = "ZIP Path: ${doc.relPath}\nExact Size: ${formatSize(doc.origSize)} (Original Quality)",
+                                                    fontFamily = FontFamily.Monospace,
+                                                    style = MaterialTheme.typography.bodySmall
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // SEPARATED SECTION 2: VIDEOS & INDIVIDUAL OVERRIDES
+                    Card(modifier = Modifier.fillMaxWidth()) {
+                        Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "🎬 Video Files (${summary.videoCount})",
+                                    style = MaterialTheme.typography.titleMedium,
+                                    fontWeight = FontWeight.Bold
+                                )
+                                TextButton(onClick = { showVideosSection = !showVideosSection }) {
+                                    Text(if (showVideosSection) "▲ Hide Videos" else "▼ Show Videos")
+                                }
+                            }
+                            Text(
+                                text = "Bulk Quality: $appliedBulkQuality • Optionally override individual videos below and tap Apply Overrides.",
+                                style = MaterialTheme.typography.bodySmall
+                            )
+
+                            if (showVideosSection) {
+                                Divider()
+                                if (summary.videos.isEmpty()) {
+                                    Text("No video files in this link.", style = MaterialTheme.typography.bodySmall)
+                                } else {
+                                    summary.videos.forEachIndexed { idx, vid ->
+                                        val effectiveQuality = draftVideoOverrides[vid.id] ?: draftBulkQuality
+                                        val estObj = vid.qualities[effectiveQuality]
+                                        val displayBytes = if (effectiveQuality == "SKIP") 0L else (estObj?.bytes ?: vid.origSize)
+                                        val displayLabel = if (effectiveQuality == "SKIP") "skipped" else (estObj?.label ?: "estimated")
+
+                                        Surface(
+                                            color = MaterialTheme.colorScheme.surfaceVariant,
+                                            shape = MaterialTheme.shapes.small,
+                                            modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
+                                        ) {
+                                            Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                                Text("${idx + 1}. ${vid.name}", fontWeight = FontWeight.SemiBold)
+                                                Text(
+                                                    text = "ZIP Path: ${vid.relPath}\n" +
+                                                           "Source: ${vid.width}x${vid.height} (${vid.height}p) • ${formatDuration(vid.durationSec)} • Orig: ${formatSize(vid.origSize)}\n" +
+                                                           "Selected ($effectiveQuality): ${formatSize(displayBytes)} [$displayLabel]",
+                                                    fontFamily = FontFamily.Monospace,
+                                                    style = MaterialTheme.typography.bodySmall
+                                                )
+
+                                                Row(
+                                                    modifier = Modifier.horizontalScroll(rememberScrollState()),
+                                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                                ) {
+                                                    val overrideChoices = listOf("Bulk", "Original", "480p", "360p", "240p", "144p", "SKIP")
+                                                    overrideChoices.forEach { choice ->
+                                                        val isChipSelected = if (choice == "Bulk") !draftVideoOverrides.containsKey(vid.id)
+                                                        else draftVideoOverrides[vid.id] == choice
+
+                                                        FilterChip(
+                                                            selected = isChipSelected,
+                                                            onClick = {
+                                                                val mutable = draftVideoOverrides.toMutableMap()
+                                                                if (choice == "Bulk") mutable.remove(vid.id)
+                                                                else mutable[vid.id] = choice
+                                                                draftVideoOverrides = mutable
+                                                            },
+                                                            label = { Text(choice) }
+                                                        )
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    Button(
+                                        onClick = {
+                                            appliedVideoOverrides = draftVideoOverrides
+                                            statusBanner = "Applied ${appliedVideoOverrides.size} individual video override(s)."
+                                            Toast.makeText(context, "Video Overrides Applied!", Toast.LENGTH_SHORT).show()
+                                        },
+                                        modifier = Modifier.fillMaxWidth()
+                                    ) {
+                                        Text("✅ Apply Individual Video Overrides (${draftVideoOverrides.size} custom)")
+                                    }
                                 }
                             }
                         }
@@ -496,10 +688,10 @@ fun MilestoneOneScreen() {
                                 onClick = {
                                     isBusy = true
                                     scope.launch {
-                                        statusBanner = "Waking 4-CPU GitHub Cloud Server (~45s)..."
+                                        statusBanner = "Restarting 4-CPU GitHub Cloud Server with latest code (~45s)..."
                                         val triggered = triggerGitHubBackendWorkflow(appliedGhRepo, appliedGhPat)
                                         if (!triggered) {
-                                            statusBanner = "Could not trigger via token. Check PAT or start 'Run DriveZip Cloud Backend' in GitHub Actions."
+                                            statusBanner = "Could not trigger via token. Start 'Run DriveZip Cloud Backend' in GitHub Actions."
                                             isBusy = false
                                             return@launch
                                         }
@@ -512,7 +704,8 @@ fun MilestoneOneScreen() {
                                                 appliedBackendUrl = candidate
                                                 draftBackendUrl = candidate
                                                 prefs.edit().putString("backend_url", candidate).apply()
-                                                statusBanner = "Cloud Server Awake & Applied: $candidate"
+                                                val health = checkBackendHealth(candidate, appliedBackendKey)
+                                                statusBanner = "Cloud Server Awake & Applied: $candidate\n$health"
                                                 break
                                             }
                                         }
@@ -522,7 +715,7 @@ fun MilestoneOneScreen() {
                                 enabled = !isBusy && appliedGhPat.isNotBlank(),
                                 modifier = Modifier.weight(1f)
                             ) {
-                                Text("🚀 1-Tap Wake Cloud")
+                                Text("🚀 1-Tap Wake / Restart Cloud")
                             }
 
                             OutlinedButton(
@@ -661,7 +854,7 @@ fun MilestoneOneScreen() {
                             onClick = {
                                 appliedOauthToken = draftOauthToken
                                 prefs.edit().putString("oauth_token", appliedOauthToken).apply()
-                                statusBanner = "Applied OAuth 2.0 Access Token (${appliedOauthToken.take(12)}...)."
+                                statusBanner = "Applied OAuth 2.0 Access Token."
                                 Toast.makeText(context, "OAuth Token Applied!", Toast.LENGTH_SHORT).show()
                             },
                             modifier = Modifier.fillMaxWidth()
@@ -693,6 +886,15 @@ private fun formatDuration(sec: Int): String {
     val m = (sec % 3600) / 60
     val s = sec % 60
     return if (h > 0) "${h}h ${m}m ${s}s" else "${m}m ${s}s"
+}
+
+private fun getTabletFreeStorageBytes(): Long {
+    return try {
+        val stat = StatFs(Environment.getExternalStorageDirectory().path)
+        stat.availableBlocksLong * stat.blockSizeLong
+    } catch (_: Exception) {
+        10L * 1024L * 1024L * 1024L
+    }
 }
 
 private suspend fun fetchLiveUrlUncached(repo: String): String? = withContext(Dispatchers.IO) {
@@ -741,13 +943,13 @@ private suspend fun checkBackendHealth(rawUrl: String, key: String): String = wi
     }
 }
 
-private suspend fun inspectSingleResource(
+private suspend fun scanFolderOrFileRecursive(
     rawUrl: String,
     backendKey: String,
     driveLink: String,
     oauthToken: String,
     driveApiKey: String
-): Result<SingleInspectResult> = withContext(Dispatchers.IO) {
+): Result<FolderScanSummary> = withContext(Dispatchers.IO) {
     try {
         val clean = rawUrl.trimEnd('/')
         val payload = JSONObject()
@@ -767,36 +969,73 @@ private suspend fun inspectSingleResource(
             if (!resp.isSuccessful) return@withContext Result.failure(RuntimeException("HTTP ${resp.code}: $str"))
             val json = JSONObject(str)
 
-            val qList = mutableListOf<QualityOption>()
-            val qObj = json.optJSONObject("qualities")
+            val vTotalsObj = json.getJSONObject("video_quality_totals")
+            val vTotals = mutableMapOf<String, Long>()
             for (qKey in listOf("Original", "480p", "360p", "240p", "144p")) {
-                val sub = qObj?.optJSONObject(qKey)
-                if (sub != null) {
-                    qList.add(
-                        QualityOption(
-                            quality = qKey,
+                vTotals[qKey] = vTotalsObj.optLong(qKey, 0L)
+            }
+
+            val docsArr = json.optJSONArray("documents") ?: JSONArray()
+            val docsList = mutableListOf<DocumentItem>()
+            for (i in 0 until docsArr.length()) {
+                val d = docsArr.getJSONObject(i)
+                docsList.add(
+                    DocumentItem(
+                        id = d.getString("id"),
+                        name = d.getString("name"),
+                        relPath = d.getString("rel_path"),
+                        mimeType = d.getString("mime_type"),
+                        origSize = d.optLong("orig_size", 0L),
+                        isWorkspace = d.optBoolean("is_workspace", false),
+                        canDownload = d.optBoolean("can_download", true)
+                    )
+                )
+            }
+
+            val vidsArr = json.optJSONArray("videos") ?: JSONArray()
+            val vidsList = mutableListOf<VideoItem>()
+            for (i in 0 until vidsArr.length()) {
+                val v = vidsArr.getJSONObject(i)
+                val qMap = mutableMapOf<String, QualityEstimate>()
+                val qObj = v.optJSONObject("qualities")
+                for (qKey in listOf("Original", "480p", "360p", "240p", "144p")) {
+                    val sub = qObj?.optJSONObject(qKey)
+                    if (sub != null) {
+                        qMap[qKey] = QualityEstimate(
                             bytes = sub.optLong("bytes", 0L),
                             isCopy = sub.optBoolean("is_copy", false),
                             label = sub.optString("label", "estimated")
                         )
-                    )
+                    }
                 }
+                vidsList.add(
+                    VideoItem(
+                        id = v.getString("id"),
+                        name = v.getString("name"),
+                        relPath = v.getString("rel_path"),
+                        origSize = v.optLong("orig_size", 0L),
+                        width = v.optInt("width", 0),
+                        height = v.optInt("height", 0),
+                        durationSec = (v.optLong("duration_ms", 0L) / 1000L).toInt(),
+                        canDownload = v.optBoolean("can_download", true),
+                        qualities = qMap
+                    )
+                )
             }
 
             Result.success(
-                SingleInspectResult(
+                FolderScanSummary(
                     resourceId = json.getString("resource_id"),
-                    name = json.getString("name"),
-                    mimeType = json.getString("mime_type"),
+                    title = json.getString("title"),
                     isFolder = json.getBoolean("is_folder"),
-                    isVideo = json.getBoolean("is_video"),
-                    isPdfOrDoc = json.getBoolean("is_document"),
-                    origSizeBytes = json.optLong("orig_size_bytes", 0L),
-                    width = json.optInt("width", 0),
-                    height = json.optInt("height", 0),
-                    durationSec = (json.optLong("duration_ms", 0L) / 1000L).toInt(),
-                    canDownload = json.optBoolean("can_download", true),
-                    qualities = qList
+                    totalFiles = json.getInt("total_files"),
+                    documentCount = json.getInt("document_count"),
+                    documentTotalBytes = json.getLong("document_total_bytes"),
+                    videoCount = json.getInt("video_count"),
+                    videoTotalDurationSec = json.getInt("video_total_duration_sec"),
+                    videoQualityTotals = vTotals,
+                    documents = docsList,
+                    videos = vidsList
                 )
             )
         }
