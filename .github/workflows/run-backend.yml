@@ -15,26 +15,27 @@ concurrency:
 permissions:
   contents: write
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-
 jobs:
   cloud-backend:
     runs-on: ubuntu-24.04
     timeout-minutes: 355
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
+      - name: Checkout Repository (Node 24 Native)
+        uses: actions/checkout@v6
 
-      - name: Fast Install Python Venv & Cloudflared
+      - name: Unlock 65+ GB SSD Space & Setup Turbo Dependencies
         run: |
-          if ! command -v ffmpeg >/dev/null 2>&1; then
-            sudo apt-get update -y && sudo apt-get install -y ffmpeg
+          # Free ~55 GB of unused runner SDKs in background so /tmp has 65+ GB free for full-folder caching
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL &
+          if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v aria2c >/dev/null 2>&1; then
+            sudo apt-get update -y && sudo apt-get install -y ffmpeg aria2
           fi
           python3 -m venv venv
           ./venv/bin/pip install -q fastapi uvicorn httpx pydantic
           wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O cloudflared
           chmod +x cloudflared
+          wait || true
+          df -h /tmp
 
       - name: Start FastAPI & Force-Publish New Tunnel URL
         run: |
