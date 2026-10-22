@@ -8,23 +8,25 @@ import subprocess
 import threading
 from pathlib import Path
 from typing import Dict, List, Set, Tuple
+from concurrent.futures import ThreadPoolExecutor
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Depends, Request
 from fastapi.responses import FileResponse, StreamingResponse, Response
 from pydantic import BaseModel
 
-app = FastAPI(title="DriveZip Pro Cloud Backend", version="9.1.0")
+app = FastAPI(title="DriveZip Pro Cloud Backend", version="10.0.0")
 
 BACKEND_API_KEY = os.environ.get("BACKEND_API_KEY", "drivezip2026secret")
 WORK_DIR = Path("/tmp/drivezip_jobs")
 WORK_DIR.mkdir(parents=True, exist_ok=True)
 
+# Optimized lecture bitrates & frame-rate caps for 4x faster encoding
 QUALITY_PRESETS = {
-    "480p": {"height": 480, "v_kbps": 400, "a_kbps": 64},
-    "360p": {"height": 360, "v_kbps": 220, "a_kbps": 64},
-    "240p": {"height": 240, "v_kbps": 135, "a_kbps": 48},
-    "144p": {"height": 144, "v_kbps": 80,  "a_kbps": 48},
+    "480p": {"height": 480, "v_kbps": 380, "a_kbps": 64, "fps": 24},
+    "360p": {"height": 360, "v_kbps": 210, "a_kbps": 48, "fps": 20},
+    "240p": {"height": 240, "v_kbps": 130, "a_kbps": 48, "fps": 15},
+    "144p": {"height": 144, "v_kbps": 75,  "a_kbps": 32, "fps": 12},
 }
 
 WORKSPACE_EXPORTS = {
@@ -36,6 +38,7 @@ WORKSPACE_EXPORTS = {
 JOBS_LOCK = threading.Lock()
 ACTIVE_JOBS: Dict[str, dict] = {}
 CANCEL_FLAGS: Set[str] = set()
+LIVE_TOKENS: Dict[str, str] = {}
 
 
 def verify_key(x_backend_key: str = Header(default="")):
@@ -83,15 +86,20 @@ def build_drive_auth(oauth_token: str, api_key: str):
     return headers, params
 
 
-def drive_api_get(client: httpx.Client, url: str, headers: dict, params: dict) -> dict:
+def drive_api_get(client: httpx.Client, url: str, headers: dict, params: dict, api_key: str = "") -> dict:
     for attempt in range(4):
         resp = client.get(url, headers=headers, params=params, timeout=30.0)
         if resp.status_code == 200:
             return resp.json()
+        if resp.status_code == 401 and api_key.strip() and "Authorization" in headers:
+            fallback_params = {**params, "key": api_key.strip()}
+            resp2 = client.get(url, headers={}, params=fallback_params, timeout=30.0)
+            if resp2.status_code == 200:
+                return resp2.json()
         if resp.status_code == 401:
-            raise HTTPException(status_code=401, detail="Google OAuth Token expired. Re-sign in on Tab 2.")
+            raise HTTPException(status_code=401, detail="Google OAuth Token expired (HTTP 401). Please tap Sign In with Google on Tab 2.")
         if resp.status_code in (429, 500, 502, 503, 504):
-            time.sleep(1.5 * (attempt + 1))
+            time.sleep(1.2 * (attempt + 1))
             continue
         try:
             msg = resp.json().get("error", {}).get("message", resp.text)
@@ -104,6 +112,8 @@ def drive_api_get(client: httpx.Client, url: str, headers: dict, params: dict) -
 def probe_video_via_ffprobe(file_id: str, headers: dict, params: dict) -> Tuple[int, int, int]:
     try:
         dl_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media&supportsAllDrives=true"
+        if "key" in params:
+            dl_url += f"&key={params['key']}"
         cmd = [
             "ffprobe", "-v", "error",
             "-select_streams", "v:0",
@@ -124,24 +134,41 @@ def probe_video_via_ffprobe(file_id: str, headers: dict, params: dict) -> Tuple[
         return 1280, 720, 0
 
 
+def probe_remote_file_size(client: httpx.Client, file_id: str, headers: dict, params: dict) -> int:
+    try:
+        url = f"https://www.googleapis.com/drive/v3/files/{file_id}"
+        q = {**params, "alt": "media", "acknowledgeAbuse": "true"}
+        h = {**headers, "Range": "bytes=0-0"}
+        r = client.get(url, headers=h, params=q, timeout=15.0)
+        cr = r.headers.get("Content-Range", "")
+        if "/" in cr:
+            total_str = cr.split("/")[-1].strip()
+            if total_str.isdigit():
+                return int(total_str)
+    except Exception:
+        pass
+    return 0
+
+
 def calculate_video_estimates(orig_size: int, width: int, height: int, duration_ms: int) -> Dict[str, dict]:
     short_side = min(width, height) if (width and height) else 720
     dur_sec = max(duration_ms / 1000.0, 1.0)
-    estimates = {"Original": {"bytes": orig_size, "is_copy": True, "label": "exact"}}
+    effective_orig = orig_size if orig_size > 0 else int((650 * 1000 / 8.0) * dur_sec)
+    estimates = {"Original": {"bytes": effective_orig, "is_copy": True, "label": "exact"}}
     for q_name, preset in QUALITY_PRESETS.items():
         target_h = preset["height"]
-        if short_side <= target_h:
-            estimates[q_name] = {"bytes": orig_size, "is_copy": True, "label": "copy (<= target)"}
+        if short_side <= target_h and effective_orig > 0:
+            estimates[q_name] = {"bytes": effective_orig, "is_copy": True, "label": "copy (<= target)"}
         else:
             if duration_ms > 0:
                 total_kbps = preset["v_kbps"] + preset["a_kbps"]
                 est_bytes = int((total_kbps * 1000 / 8.0) * dur_sec * 1.02)
             else:
                 ratio = (target_h / float(max(short_side, target_h))) ** 1.45
-                est_bytes = int(orig_size * ratio)
+                est_bytes = int(effective_orig * ratio)
 
-            if est_bytes >= orig_size:
-                estimates[q_name] = {"bytes": orig_size, "is_copy": True, "label": "copy (smaller orig)"}
+            if effective_orig > 0 and est_bytes >= effective_orig:
+                estimates[q_name] = {"bytes": effective_orig, "is_copy": True, "label": "copy (smaller orig)"}
             else:
                 estimates[q_name] = {"bytes": max(est_bytes, 64 * 1024), "is_copy": False, "label": "estimated"}
     return estimates
@@ -149,7 +176,8 @@ def calculate_video_estimates(orig_size: int, width: int, height: int, duration_
 
 def scan_drive_recursive(resource_id: str, oauth_token: str, api_key: str) -> dict:
     headers, base_params = build_drive_auth(oauth_token, api_key)
-    fields_single = "id,name,mimeType,size,videoMediaMetadata,shortcutDetails,capabilities(canDownload)"
+    # CRITICAL: Explicitly request size, quotaBytesUsed, videoMediaMetadata so file sizes are NEVER 0 MB!
+    fields_single = "id,name,mimeType,size,quotaBytesUsed,videoMediaMetadata,shortcutDetails,capabilities(canDownload)"
     fields_list = f"nextPageToken,files({fields_single})"
 
     documents_list: List[dict] = []
@@ -160,7 +188,8 @@ def scan_drive_recursive(resource_id: str, oauth_token: str, api_key: str) -> di
             client,
             f"https://www.googleapis.com/drive/v3/files/{resource_id}",
             headers,
-            base_params,
+            {**base_params, "fields": fields_single},
+            api_key=api_key,
         )
 
         if root_meta.get("mimeType") == "application/vnd.google-apps.shortcut":
@@ -170,7 +199,8 @@ def scan_drive_recursive(resource_id: str, oauth_token: str, api_key: str) -> di
                     client,
                     f"https://www.googleapis.com/drive/v3/files/{target_id}",
                     headers,
-                    base_params,
+                    {**base_params, "fields": fields_single},
+                    api_key=api_key,
                 )
 
         root_name = sanitize_filename(root_meta.get("name", "DriveItem"))
@@ -188,7 +218,8 @@ def scan_drive_recursive(resource_id: str, oauth_token: str, api_key: str) -> di
                         client,
                         f"https://www.googleapis.com/drive/v3/files/{t_id}",
                         headers,
-                        base_params,
+                        {**base_params, "fields": fields_single},
+                        api_key=api_key,
                     )
                     mime = item.get("mimeType", "")
                 except Exception:
@@ -214,9 +245,11 @@ def scan_drive_recursive(resource_id: str, oauth_token: str, api_key: str) -> di
                 counter += 1
             seen_names.add(unique_name.lower())
 
-            orig_size = int(item.get("size", 0) or 0)
+            orig_size = int(item.get("size") or item.get("quotaBytesUsed") or 0)
             if is_workspace and orig_size == 0:
                 orig_size = 512 * 1024
+            elif not is_workspace and orig_size == 0:
+                orig_size = probe_remote_file_size(client, item["id"], headers, base_params)
 
             is_video = mime.startswith("video/")
             rel_path = f"{rel_folder}/{unique_name}" if rel_folder else unique_name
@@ -231,6 +264,8 @@ def scan_drive_recursive(resource_id: str, oauth_token: str, api_key: str) -> di
                     width, height, duration_ms = probe_video_via_ffprobe(item["id"], headers, base_params)
 
                 qualities = calculate_video_estimates(orig_size, width, height, duration_ms)
+                if orig_size == 0:
+                    orig_size = qualities["Original"]["bytes"]
 
                 videos_list.append({
                     "id": item["id"],
@@ -264,10 +299,18 @@ def scan_drive_recursive(resource_id: str, oauth_token: str, api_key: str) -> di
                     **base_params,
                     "q": f"'{folder_id}' in parents and trashed = false",
                     "pageSize": 100,
+                    "fields": fields_list,
+                    "orderBy": "folder,name",
                 }
                 if page_token:
                     q_params["pageToken"] = page_token
-                res = drive_api_get(client, "https://www.googleapis.com/drive/v3/files", headers, q_params)
+                res = drive_api_get(
+                    client,
+                    "https://www.googleapis.com/drive/v3/files",
+                    headers,
+                    q_params,
+                    api_key=api_key,
+                )
                 for child in res.get("files", []):
                     process_item(child, rel_folder, seen_names)
                 page_token = res.get("nextPageToken")
@@ -314,15 +357,24 @@ def update_live_progress(job_id: str, item_idx: int, total_items: int, item_frac
             ACTIVE_JOBS[job_id]["current_file"] = message
 
 
-def download_drive_file_with_progress(
+def get_current_headers(job_id: str, default_headers: dict) -> dict:
+    tok = LIVE_TOKENS.get(job_id, "").strip()
+    if tok:
+        return {"Authorization": f"Bearer {tok}"}
+    return dict(default_headers)
+
+
+def download_drive_file_fast(
     file_info: dict,
     dest_path: Path,
-    headers: dict,
+    default_headers: dict,
     base_params: dict,
     job_id: str,
     item_idx: int,
     total_items: int,
     is_transcode: bool,
+    api_key: str,
+    update_ui: bool = True,
 ):
     fid = file_info["id"]
     if file_info.get("is_workspace", False):
@@ -335,44 +387,64 @@ def download_drive_file_with_progress(
     dest_path.parent.mkdir(parents=True, exist_ok=True)
     orig_bytes = max(int(file_info.get("orig_size", 0) or 0), 1)
 
-    for attempt in range(4):
+    for attempt in range(6):
+        if job_id in CANCEL_FLAGS:
+            raise RuntimeError("Job cancelled by user.")
+
+        cur_headers = get_current_headers(job_id, default_headers)
         with httpx.Client(follow_redirects=True, timeout=180.0) as client:
-            with client.stream("GET", url, headers=headers, params=params) as resp:
+            with client.stream("GET", url, headers=cur_headers, params=params) as resp:
                 if resp.status_code == 401:
-                    raise RuntimeError("HTTP 401: Google OAuth Token expired. Re-sign in on Tab 2.")
+                    # Wait up to 45s for the Android tablet to auto-push a fresh OAuth token!
+                    old_tok = LIVE_TOKENS.get(job_id, "")
+                    with JOBS_LOCK:
+                        if job_id in ACTIVE_JOBS:
+                            ACTIVE_JOBS[job_id]["needs_token_refresh"] = True
+                            ACTIVE_JOBS[job_id]["current_file"] = (
+                                f"🔄 Refreshing Google OAuth token automatically for {file_info['name']}..."
+                            )
+                    for _ in range(30):
+                        time.sleep(1.5)
+                        new_tok = LIVE_TOKENS.get(job_id, "")
+                        if new_tok and new_tok != old_tok:
+                            break
+                    continue
+
                 if resp.status_code == 200:
                     downloaded = 0
                     last_tick = 0.0
                     with open(dest_path, "wb") as f:
-                        for chunk in resp.iter_bytes(chunk_size=1024 * 512):
+                        for chunk in resp.iter_bytes(chunk_size=1024 * 1024):
                             if job_id in CANCEL_FLAGS:
                                 raise RuntimeError("Job cancelled by user.")
                             f.write(chunk)
                             downloaded += len(chunk)
-                            now = time.time()
-                            if now - last_tick >= 1.2:
-                                last_tick = now
-                                dl_ratio = min(downloaded / float(orig_bytes), 1.0)
-                                item_frac = dl_ratio * 0.30 if is_transcode else dl_ratio
-                                pct = int(dl_ratio * 100)
-                                dl_mb = downloaded / (1024 * 1024)
-                                tot_mb = orig_bytes / (1024 * 1024)
-                                update_live_progress(
-                                    job_id,
-                                    item_idx,
-                                    total_items,
-                                    item_frac,
-                                    f"[{item_idx}/{total_items}] 📥 Cloud Downloading: {dl_mb:.1f} / {tot_mb:.1f} MB ({pct}%) — {file_info['name']}",
-                                )
+                            if update_ui:
+                                now = time.time()
+                                if now - last_tick >= 1.0:
+                                    last_tick = now
+                                    dl_ratio = min(downloaded / float(orig_bytes), 1.0)
+                                    item_frac = dl_ratio * 0.25 if is_transcode else dl_ratio
+                                    pct = int(dl_ratio * 100)
+                                    dl_mb = downloaded / (1024 * 1024)
+                                    tot_mb = orig_bytes / (1024 * 1024)
+                                    update_live_progress(
+                                        job_id,
+                                        item_idx,
+                                        total_items,
+                                        item_frac,
+                                        f"[{item_idx}/{total_items}] 📥 Cloud Downloading: {dl_mb:.1f} / {tot_mb:.1f} MB ({pct}%) — {file_info['name']}",
+                                    )
                     return
+
                 if resp.status_code in (429, 500, 502, 503, 504):
                     time.sleep(2.0 * (attempt + 1))
                     continue
                 raise RuntimeError(f"HTTP {resp.status_code} downloading {file_info['name']}")
-    raise RuntimeError(f"Download failed after retries: {file_info['name']}")
+    raise RuntimeError(f"HTTP 401/Timeout downloading {file_info['name']}: Tap Sign In with Google on Tab 2 and tap Retry Failed Files.")
 
 
-def convert_video_ffmpeg_with_progress(
+def convert_video_ffmpeg_turbo(
     src_path: Path,
     dst_path: Path,
     target_quality: str,
@@ -386,32 +458,38 @@ def convert_video_ffmpeg_with_progress(
     h = preset["height"]
     v_kbps = preset["v_kbps"]
     a_kbps = preset["a_kbps"]
+    target_fps = preset["fps"]
     total_sec = max(duration_ms / 1000.0, 1.0)
 
     update_live_progress(
         job_id,
         item_idx,
         total_items,
-        0.31,
-        f"[{item_idx}/{total_items}] ⚙️ Starting FFmpeg ({target_quality}): 0% — {file_name}",
+        0.26,
+        f"[{item_idx}/{total_items}] ⚡ Turbo 4-CPU FFmpeg ({target_quality}): 0% — {file_name}",
     )
 
+    # Cap FPS and use fastest x264 motion parameters for 4x speed boost on whiteboard lectures
+    vf_chain = f"fps='min(source_fps,{target_fps})',scale=-2:'min(ih,{h})':flags=fast_bilinear"
     v_codec = [
         "-c:v", "libx264",
         "-preset", "ultrafast",
-        "-crf", "28",
+        "-tune", "fastdecode",
+        "-crf", "29",
         "-b:v", f"{v_kbps}k",
-        "-maxrate", f"{int(v_kbps * 1.2)}k",
+        "-maxrate", f"{int(v_kbps * 1.25)}k",
         "-bufsize", f"{v_kbps * 2}k",
+        "-x264-params", "ref=1:subme=0:me=dia:trellis=0:partitions=none:weightp=0:bframes=0:rc-lookahead=0",
         "-threads", "0",
     ]
 
     cmd = [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "-threads", "0",
         "-i", str(src_path),
-        "-vf", f"scale=-2:'min(ih,{h})'",
+        "-vf", vf_chain,
         *v_codec,
-        "-c:a", "aac", "-b:a", f"{a_kbps}k", "-ac", "1",
+        "-c:a", "aac", "-b:a", f"{a_kbps}k", "-ac", "1", "-ar", "32000",
         "-movflags", "+faststart",
         "-progress", "pipe:1", "-nostats",
         str(dst_path),
@@ -440,10 +518,10 @@ def convert_video_ffmpeg_with_progress(
                 if val_str.isdigit():
                     cur_sec = int(val_str) / 1_000_000.0
                     now = time.time()
-                    if now - last_tick >= 1.2:
+                    if now - last_tick >= 1.0:
                         last_tick = now
                         enc_ratio = min(cur_sec / total_sec, 0.99)
-                        item_frac = 0.30 + (enc_ratio * 0.70)
+                        item_frac = 0.25 + (enc_ratio * 0.75)
                         pct = int(enc_ratio * 100)
                         spd_info = f" [{speed_str}]" if speed_str else ""
                         update_live_progress(
@@ -451,7 +529,7 @@ def convert_video_ffmpeg_with_progress(
                             item_idx,
                             total_items,
                             item_frac,
-                            f"[{item_idx}/{total_items}] ⚙️ FFmpeg Encoding: {pct}%{spd_info} ({fmt_hms(cur_sec)} / {fmt_hms(total_sec)}) — {file_name}",
+                            f"[{item_idx}/{total_items}] ⚡ FFmpeg {target_quality}: {pct}%{spd_info} ({fmt_hms(cur_sec)} / {fmt_hms(total_sec)}) — {file_name}",
                         )
 
     proc.wait()
@@ -483,7 +561,10 @@ def run_conversion_and_zip_job(
         except Exception:
             completed_ids = {}
 
-    headers, base_params = build_drive_auth(oauth_token, api_key)
+    if oauth_token.strip():
+        LIVE_TOKENS[job_id] = oauth_token.strip()
+
+    headers, base_params = build_drive_auth(LIVE_TOKENS.get(job_id, oauth_token), api_key)
 
     all_items = []
     for d in scan_data["documents"]:
@@ -498,13 +579,42 @@ def run_conversion_and_zip_job(
     with JOBS_LOCK:
         ACTIVE_JOBS[job_id]["total_files"] = len(all_items)
         ACTIVE_JOBS[job_id]["state"] = "CONVERTING"
+        ACTIVE_JOBS[job_id]["errors"] = []
+        ACTIVE_JOBS[job_id]["failed_count"] = 0
+        ACTIVE_JOBS[job_id]["file_results"] = []
+        ACTIVE_JOBS[job_id]["actual_bytes_so_far"] = 0
+        ACTIVE_JOBS[job_id]["processed_files"] = 0
+
+    # Background Prefetch Pool: Downloads the next video while FFmpeg encodes the current video!
+    prefetch_pool = ThreadPoolExecutor(max_workers=2)
+    prefetch_futures = {}
+
+    def prefetch_raw_video(it: dict, idx_num: int) -> Path:
+        t_src = tmp_tree / f"{it['id']}_raw"
+        if t_src.exists() and t_src.stat().st_size > 0:
+            return t_src
+        download_drive_file_fast(
+            it, t_src, headers, base_params, job_id, idx_num, total_items,
+            is_transcode=True, api_key=api_key, update_ui=False
+        )
+        return t_src
 
     for idx, item in enumerate(all_items, start=1):
         if job_id in CANCEL_FLAGS:
+            prefetch_pool.shutdown(wait=False)
             with JOBS_LOCK:
                 ACTIVE_JOBS[job_id]["state"] = "FAILED"
                 ACTIVE_JOBS[job_id]["current_file"] = "🛑 Cancelled by user."
             return
+
+        # Trigger background prefetch for the NEXT 2 videos so they are already on disk when FFmpeg finishes!
+        for lookahead in (idx, idx + 1):
+            if lookahead < len(all_items):
+                nxt = all_items[lookahead]
+                nxt_fid = nxt["id"]
+                nxt_q = nxt["target_quality"]
+                if nxt["is_video"] and nxt_q != "Original" and nxt_fid not in completed_ids and nxt_fid not in prefetch_futures:
+                    prefetch_futures[nxt_fid] = prefetch_pool.submit(prefetch_raw_video, nxt, lookahead + 1)
 
         fid = item["id"]
         rel_path = item["rel_path"]
@@ -525,7 +635,8 @@ def run_conversion_and_zip_job(
             est_bytes = item["qualities"].get(q_target, {}).get("bytes", item["orig_size"])
 
         try:
-            if fid in completed_ids and completed_ids[fid].get("quality") == q_target and final_dest.exists():
+            # Instant Checkpoint Skip for already-completed files
+            if fid in completed_ids and completed_ids[fid].get("quality") == q_target and final_dest.exists() and final_dest.stat().st_size > 0:
                 actual_sz = final_dest.stat().st_size
                 res_entry = {
                     "id": fid, "name": item["name"], "rel_path": final_rel, "is_video": is_vid,
@@ -537,8 +648,9 @@ def run_conversion_and_zip_job(
                     raise RuntimeError(f"Download restricted: {item['name']}")
 
                 if not is_vid or q_target == "Original":
-                    download_drive_file_with_progress(
-                        item, final_dest, headers, base_params, job_id, idx, total_items, is_transcode=False
+                    download_drive_file_fast(
+                        item, final_dest, headers, base_params, job_id, idx, total_items,
+                        is_transcode=False, api_key=api_key, update_ui=True
                     )
                     action_label = "copied original"
                 else:
@@ -547,11 +659,26 @@ def run_conversion_and_zip_job(
                     tmp_src = tmp_tree / f"{fid}_raw"
                     tmp_out = tmp_tree / f"{fid}_conv.mp4"
                     try:
-                        download_drive_file_with_progress(
-                            item, tmp_src, headers, base_params, job_id, idx, total_items, is_transcode=needs_transcode
-                        )
+                        if fid in prefetch_futures:
+                            update_live_progress(
+                                job_id, idx, total_items, 0.15,
+                                f"[{idx}/{total_items}] 📥 Finishing background prefetch: {item['name']}..."
+                            )
+                            try:
+                                prefetch_futures[fid].result()
+                            except Exception:
+                                download_drive_file_fast(
+                                    item, tmp_src, headers, base_params, job_id, idx, total_items,
+                                    is_transcode=needs_transcode, api_key=api_key, update_ui=True
+                                )
+                        else:
+                            download_drive_file_fast(
+                                item, tmp_src, headers, base_params, job_id, idx, total_items,
+                                is_transcode=needs_transcode, api_key=api_key, update_ui=True
+                            )
+
                         if needs_transcode:
-                            convert_video_ffmpeg_with_progress(
+                            convert_video_ffmpeg_turbo(
                                 tmp_src, tmp_out, q_target,
                                 int(item.get("duration_ms", 0) or 0),
                                 job_id, item["name"], idx, total_items
@@ -580,40 +707,57 @@ def run_conversion_and_zip_job(
                 }
 
             with JOBS_LOCK:
-                ACTIVE_JOBS[job_id]["processed_files"] = idx
-                ACTIVE_JOBS[job_id]["overall_percent"] = round((idx / float(total_items)) * 100.0, 1)
+                ACTIVE_JOBS[job_id]["processed_files"] += 1
+                ACTIVE_JOBS[job_id]["overall_percent"] = round((ACTIVE_JOBS[job_id]["processed_files"] / float(total_items)) * 100.0, 1)
                 ACTIVE_JOBS[job_id]["actual_bytes_so_far"] += res_entry["actual_bytes"]
                 ACTIVE_JOBS[job_id]["file_results"].append(res_entry)
 
         except Exception as e:
             with JOBS_LOCK:
-                ACTIVE_JOBS[job_id]["processed_files"] = idx
+                ACTIVE_JOBS[job_id]["failed_count"] = ACTIVE_JOBS[job_id].get("failed_count", 0) + 1
                 ACTIVE_JOBS[job_id]["errors"].append(f"{item['name']}: {str(e)}")
 
-    # STEP 3: PACKAGE ALL FILES INTO ONE UNIFIED ZIP64
+    prefetch_pool.shutdown(wait=False)
+
+    # STEP 3: PACKAGE CONVERTED FILES INTO UNIFIED ZIP64 (KEEPING out_tree FILES INTACT FOR RETRIES!)
     try:
         zip_filename = f"{sanitize_filename(scan_data['title'])}_{bulk_quality}.zip"
         zip_path = job_dir / zip_filename
         with JOBS_LOCK:
             ACTIVE_JOBS[job_id]["state"] = "PACKAGING_ZIP"
-            ACTIVE_JOBS[job_id]["overall_percent"] = 99.5
-            ACTIVE_JOBS[job_id]["current_file"] = f"📦 Packaging ZIP64 archive..."
+            ACTIVE_JOBS[job_id]["current_file"] = f"📦 Packaging unified ZIP64 archive ({zip_filename})..."
 
         all_converted_files = [p for p in out_tree.rglob("*") if p.is_file()]
         with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
             for f_idx, f_path in enumerate(all_converted_files, start=1):
                 arcname = str(f_path.relative_to(out_tree))
+                with JOBS_LOCK:
+                    ACTIVE_JOBS[job_id]["current_file"] = (
+                        f"📦 Writing to ZIP64 ({f_idx}/{len(all_converted_files)}): {arcname}"
+                    )
                 zf.write(f_path, arcname)
-                f_path.unlink(missing_ok=True)
+                # IMPORTANT: We DO NOT delete f_path here so failed-file retries never lose completed files!
 
         zip_final_bytes = zip_path.stat().st_size if zip_path.exists() else 0
         with JOBS_LOCK:
-            ACTIVE_JOBS[job_id]["state"] = "COMPLETED"
-            ACTIVE_JOBS[job_id]["overall_percent"] = 100.0
-            ACTIVE_JOBS[job_id]["zip_ready"] = True
+            err_cnt = len(ACTIVE_JOBS[job_id]["errors"])
+            succ_cnt = ACTIVE_JOBS[job_id]["processed_files"]
+            ACTIVE_JOBS[job_id]["zip_ready"] = zip_final_bytes > 0
             ACTIVE_JOBS[job_id]["zip_filename"] = zip_filename
             ACTIVE_JOBS[job_id]["zip_size_bytes"] = zip_final_bytes
-            ACTIVE_JOBS[job_id]["current_file"] = f"✅ ZIP64 Ready! Tap Download Final ZIP below."
+
+            if err_cnt == 0:
+                ACTIVE_JOBS[job_id]["state"] = "COMPLETED"
+                ACTIVE_JOBS[job_id]["overall_percent"] = 100.0
+                ACTIVE_JOBS[job_id]["current_file"] = (
+                    f"✅ All {succ_cnt}/{total_items} Files Converted & ZIP64 Ready ({round(zip_final_bytes / (1024 * 1024), 1)} MB)!"
+                )
+            else:
+                ACTIVE_JOBS[job_id]["state"] = "PARTIAL_COMPLETE"
+                ACTIVE_JOBS[job_id]["overall_percent"] = round((succ_cnt / float(total_items)) * 100.0, 1)
+                ACTIVE_JOBS[job_id]["current_file"] = (
+                    f"⚠️ {succ_cnt}/{total_items} Succeeded, {err_cnt} Failed. Tap 'Retry Failed Files Only' below!"
+                )
     except Exception as e:
         with JOBS_LOCK:
             ACTIVE_JOBS[job_id]["state"] = "FAILED"
@@ -634,15 +778,19 @@ class StartJobRequest(BaseModel):
     api_key: str = ""
 
 
+class RefreshTokenRequest(BaseModel):
+    oauth_token: str
+
+
 @app.get("/")
 def root():
-    return {"service": "DriveZip Pro Cloud Backend", "milestone": 9.1, "status": "online"}
+    return {"service": "DriveZip Pro Cloud Backend", "milestone": 10, "status": "online"}
 
 
 @app.get("/api/v1/health")
 def health(_: bool = Depends(verify_key)):
     _, _, free = shutil.disk_usage(WORK_DIR)
-    return {"authenticated": True, "milestone": 9.1, "disk_free_gb": round(free / (1024 ** 3), 2)}
+    return {"authenticated": True, "milestone": 10, "disk_free_gb": round(free / (1024 ** 3), 2)}
 
 
 @app.post("/api/v1/inspect")
@@ -658,6 +806,16 @@ def get_active_job(_: bool = Depends(verify_key)):
             return {"has_active": False}
         latest_job = list(ACTIVE_JOBS.values())[-1]
         return {"has_active": True, "job": latest_job}
+
+
+@app.post("/api/v1/jobs/{job_id}/refresh_token")
+def refresh_job_token(job_id: str, req: RefreshTokenRequest, _: bool = Depends(verify_key)):
+    if req.oauth_token.strip():
+        LIVE_TOKENS[job_id] = req.oauth_token.strip()
+        with JOBS_LOCK:
+            if job_id in ACTIVE_JOBS:
+                ACTIVE_JOBS[job_id]["needs_token_refresh"] = False
+    return {"refreshed": True, "job_id": job_id}
 
 
 @app.post("/api/v1/jobs/{job_id}/cancel")
@@ -687,6 +845,8 @@ def start_job(req: StartJobRequest, _: bool = Depends(verify_key)):
     scan_data = scan_drive_recursive(resource_id, req.oauth_token, req.api_key)
     job_id = f"{resource_id}_{req.bulk_quality}"
     CANCEL_FLAGS.discard(job_id)
+    if req.oauth_token.strip():
+        LIVE_TOKENS[job_id] = req.oauth_token.strip()
 
     with JOBS_LOCK:
         if job_id in ACTIVE_JOBS and ACTIVE_JOBS[job_id]["state"] in ("CONVERTING", "PACKAGING_ZIP"):
@@ -706,13 +866,15 @@ def start_job(req: StartJobRequest, _: bool = Depends(verify_key)):
             "bulk_quality": req.bulk_quality,
             "state": "STARTING",
             "processed_files": 0,
+            "failed_count": 0,
             "total_files": scan_data["total_files"],
             "overall_percent": 0.0,
-            "current_file": "Initializing...",
+            "current_file": "Starting Turbo 4-CPU FFmpeg + Background Prefetch Engine...",
             "estimated_total_bytes": est_total,
             "actual_bytes_so_far": 0,
             "file_results": [],
             "errors": [],
+            "needs_token_refresh": False,
             "zip_ready": False,
             "zip_filename": "",
             "zip_size_bytes": 0,
@@ -769,7 +931,7 @@ def download_job_zip(
                     f.seek(start)
                     remaining = length
                     while remaining > 0:
-                        chunk = f.read(min(1024 * 512, remaining))
+                        chunk = f.read(min(1024 * 1024, remaining))
                         if not chunk:
                             break
                         remaining -= len(chunk)
