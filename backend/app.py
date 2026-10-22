@@ -8,25 +8,25 @@ import subprocess
 import threading
 from pathlib import Path
 from typing import Dict, List, Set, Tuple
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Depends, Request
 from fastapi.responses import FileResponse, StreamingResponse, Response
 from pydantic import BaseModel
 
-app = FastAPI(title="DriveZip Pro Cloud Backend", version="10.0.0")
+app = FastAPI(title="DriveZip Pro Cloud Backend", version="11.0.0")
 
 BACKEND_API_KEY = os.environ.get("BACKEND_API_KEY", "drivezip2026secret")
 WORK_DIR = Path("/tmp/drivezip_jobs")
 WORK_DIR.mkdir(parents=True, exist_ok=True)
 
-# Optimized lecture bitrates & frame-rate caps for 4x faster encoding
+# Hyper-Speed Lecture Presets: Optimized FPS + Bitrates for Smartboard/Slide Lectures
 QUALITY_PRESETS = {
-    "480p": {"height": 480, "v_kbps": 380, "a_kbps": 64, "fps": 24},
-    "360p": {"height": 360, "v_kbps": 210, "a_kbps": 48, "fps": 20},
-    "240p": {"height": 240, "v_kbps": 130, "a_kbps": 48, "fps": 15},
-    "144p": {"height": 144, "v_kbps": 75,  "a_kbps": 32, "fps": 12},
+    "480p": {"height": 480, "v_kbps": 360, "a_kbps": 64, "fps": 15},
+    "360p": {"height": 360, "v_kbps": 200, "a_kbps": 48, "fps": 12},
+    "240p": {"height": 240, "v_kbps": 125, "a_kbps": 48, "fps": 10},
+    "144p": {"height": 144, "v_kbps": 70,  "a_kbps": 32, "fps": 8},
 }
 
 WORKSPACE_EXPORTS = {
@@ -39,6 +39,7 @@ JOBS_LOCK = threading.Lock()
 ACTIVE_JOBS: Dict[str, dict] = {}
 CANCEL_FLAGS: Set[str] = set()
 LIVE_TOKENS: Dict[str, str] = {}
+HAS_ARIA2C = shutil.which("aria2c") is not None
 
 
 def verify_key(x_backend_key: str = Header(default="")):
@@ -176,7 +177,6 @@ def calculate_video_estimates(orig_size: int, width: int, height: int, duration_
 
 def scan_drive_recursive(resource_id: str, oauth_token: str, api_key: str) -> dict:
     headers, base_params = build_drive_auth(oauth_token, api_key)
-    # CRITICAL: Explicitly request size, quotaBytesUsed, videoMediaMetadata so file sizes are NEVER 0 MB!
     fields_single = "id,name,mimeType,size,quotaBytesUsed,videoMediaMetadata,shortcutDetails,capabilities(canDownload)"
     fields_list = f"nextPageToken,files({fields_single})"
 
@@ -349,14 +349,6 @@ def fmt_hms(sec: float) -> str:
     return f"{s // 3600:02d}:{(s % 3600) // 60:02d}:{s % 60:02d}"
 
 
-def update_live_progress(job_id: str, item_idx: int, total_items: int, item_fraction: float, message: str):
-    overall = ((item_idx - 1 + max(0.0, min(item_fraction, 1.0))) / float(max(total_items, 1))) * 100.0
-    with JOBS_LOCK:
-        if job_id in ACTIVE_JOBS:
-            ACTIVE_JOBS[job_id]["overall_percent"] = round(min(overall, 99.5), 1)
-            ACTIVE_JOBS[job_id]["current_file"] = message
-
-
 def get_current_headers(job_id: str, default_headers: dict) -> dict:
     tok = LIVE_TOKENS.get(job_id, "").strip()
     if tok:
@@ -364,7 +356,21 @@ def get_current_headers(job_id: str, default_headers: dict) -> dict:
     return dict(default_headers)
 
 
-def download_drive_file_fast(
+def refresh_job_telemetry(job_id: str, item_progress: Dict[str, float], active_tasks: Dict[str, str], total_items: int):
+    with JOBS_LOCK:
+        if job_id not in ACTIVE_JOBS:
+            return
+        total_prog = sum(item_progress.values()) / float(max(total_items, 1)) * 100.0
+        ACTIVE_JOBS[job_id]["overall_percent"] = round(min(total_prog, 99.5), 1)
+        cached_cnt = ACTIVE_JOBS[job_id].get("cached_on_ssd", 0)
+        tasks_list = list(active_tasks.values())
+        if tasks_list:
+            ACTIVE_JOBS[job_id]["current_file"] = f"📥 Cloud SSD Cached: {cached_cnt}/{total_items} | " + " • ".join(tasks_list[:2])
+        else:
+            ACTIVE_JOBS[job_id]["current_file"] = f"📥 Cloud SSD Cached: {cached_cnt}/{total_items} files..."
+
+
+def download_drive_file_aria2_or_httpx(
     file_info: dict,
     dest_path: Path,
     default_headers: dict,
@@ -374,35 +380,111 @@ def download_drive_file_fast(
     total_items: int,
     is_transcode: bool,
     api_key: str,
-    update_ui: bool = True,
+    item_progress: Dict[str, float],
+    active_tasks: Dict[str, str],
 ):
     fid = file_info["id"]
-    if file_info.get("is_workspace", False):
+    is_ws = file_info.get("is_workspace", False)
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    orig_bytes = max(int(file_info.get("orig_size", 0) or 0), 1)
+    max_dl_frac = 0.25 if is_transcode else 1.0
+
+    # FAST PATH: Use 16-connection aria2c for all non-Workspace files!
+    if HAS_ARIA2C and not is_ws:
+        for aria_attempt in range(2):
+            if job_id in CANCEL_FLAGS:
+                raise RuntimeError("Job cancelled by user.")
+            cur_headers = get_current_headers(job_id, default_headers)
+            dl_url = f"https://www.googleapis.com/drive/v3/files/{fid}?alt=media&acknowledgeAbuse=true&supportsAllDrives=true"
+            if "key" in base_params and "Authorization" not in cur_headers:
+                dl_url += f"&key={base_params['key']}"
+
+            cmd = [
+                "aria2c",
+                "--allow-overwrite=true",
+                "--auto-file-renaming=false",
+                "--file-allocation=none",
+                "-x", "16",
+                "-s", "16",
+                "-k", "2M",
+                "--max-tries=2",
+                "--retry-wait=1",
+                "--timeout=30",
+                "--connect-timeout=10",
+                "--console-log-level=error",
+                "--summary-interval=0",
+                "-d", str(dest_path.parent),
+                "-o", dest_path.name,
+            ]
+            if "Authorization" in cur_headers:
+                cmd.append(f"--header=Authorization: {cur_headers['Authorization']}")
+            cmd.append(dl_url)
+
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+            while proc.poll() is None:
+                if job_id in CANCEL_FLAGS:
+                    proc.kill()
+                    raise RuntimeError("Job cancelled by user.")
+                if dest_path.exists():
+                    cur_sz = dest_path.stat().st_size
+                    dl_ratio = min(cur_sz / float(orig_bytes), 1.0)
+                    with JOBS_LOCK:
+                        item_progress[fid] = dl_ratio * max_dl_frac
+                        active_tasks[f"dl_{fid}"] = f"🚀 16x DL ({int(dl_ratio * 100)}%): {file_info['name'][:28]}"
+                    refresh_job_telemetry(job_id, item_progress, active_tasks, total_items)
+                time.sleep(0.6)
+
+            with JOBS_LOCK:
+                active_tasks.pop(f"dl_{fid}", None)
+
+            if proc.returncode == 0 and dest_path.exists() and dest_path.stat().st_size > 0:
+                with JOBS_LOCK:
+                    item_progress[fid] = max_dl_frac
+                    if job_id in ACTIVE_JOBS:
+                        ACTIVE_JOBS[job_id]["cached_on_ssd"] = ACTIVE_JOBS[job_id].get("cached_on_ssd", 0) + 1
+                refresh_job_telemetry(job_id, item_progress, active_tasks, total_items)
+                return
+
+            err_out = proc.stderr.read() if proc.stderr else ""
+            if "401" in err_out or "403" in err_out:
+                break
+
+    # FALLBACK PATH: httpx streaming with automatic 401 token refresh wait
+    if is_ws:
         url = f"https://www.googleapis.com/drive/v3/files/{fid}/export"
         params = {**base_params, "mimeType": file_info.get("export_mime", "application/pdf")}
     else:
         url = f"https://www.googleapis.com/drive/v3/files/{fid}"
         params = {**base_params, "alt": "media", "acknowledgeAbuse": "true"}
 
-    dest_path.parent.mkdir(parents=True, exist_ok=True)
-    orig_bytes = max(int(file_info.get("orig_size", 0) or 0), 1)
-
-    for attempt in range(6):
+    for attempt in range(5):
         if job_id in CANCEL_FLAGS:
             raise RuntimeError("Job cancelled by user.")
-
         cur_headers = get_current_headers(job_id, default_headers)
         with httpx.Client(follow_redirects=True, timeout=180.0) as client:
             with client.stream("GET", url, headers=cur_headers, params=params) as resp:
+                if resp.status_code == 401 and api_key.strip() and "Authorization" in cur_headers:
+                    fallback_params = {**params, "key": api_key.strip()}
+                    with client.stream("GET", url, headers={}, params=fallback_params) as resp2:
+                        if resp2.status_code == 200:
+                            with open(dest_path, "wb") as f:
+                                for chunk in resp2.iter_bytes(chunk_size=1024 * 1024):
+                                    f.write(chunk)
+                            with JOBS_LOCK:
+                                item_progress[fid] = max_dl_frac
+                                active_tasks.pop(f"dl_{fid}", None)
+                                if job_id in ACTIVE_JOBS:
+                                    ACTIVE_JOBS[job_id]["cached_on_ssd"] = ACTIVE_JOBS[job_id].get("cached_on_ssd", 0) + 1
+                            refresh_job_telemetry(job_id, item_progress, active_tasks, total_items)
+                            return
+
                 if resp.status_code == 401:
-                    # Wait up to 45s for the Android tablet to auto-push a fresh OAuth token!
                     old_tok = LIVE_TOKENS.get(job_id, "")
                     with JOBS_LOCK:
                         if job_id in ACTIVE_JOBS:
                             ACTIVE_JOBS[job_id]["needs_token_refresh"] = True
-                            ACTIVE_JOBS[job_id]["current_file"] = (
-                                f"🔄 Refreshing Google OAuth token automatically for {file_info['name']}..."
-                            )
+                            active_tasks[f"dl_{fid}"] = f"🔄 Refreshing OAuth token for {file_info['name'][:25]}..."
+                    refresh_job_telemetry(job_id, item_progress, active_tasks, total_items)
                     for _ in range(30):
                         time.sleep(1.5)
                         new_tok = LIVE_TOKENS.get(job_id, "")
@@ -419,40 +501,41 @@ def download_drive_file_fast(
                                 raise RuntimeError("Job cancelled by user.")
                             f.write(chunk)
                             downloaded += len(chunk)
-                            if update_ui:
-                                now = time.time()
-                                if now - last_tick >= 1.0:
-                                    last_tick = now
-                                    dl_ratio = min(downloaded / float(orig_bytes), 1.0)
-                                    item_frac = dl_ratio * 0.25 if is_transcode else dl_ratio
-                                    pct = int(dl_ratio * 100)
-                                    dl_mb = downloaded / (1024 * 1024)
-                                    tot_mb = orig_bytes / (1024 * 1024)
-                                    update_live_progress(
-                                        job_id,
-                                        item_idx,
-                                        total_items,
-                                        item_frac,
-                                        f"[{item_idx}/{total_items}] 📥 Cloud Downloading: {dl_mb:.1f} / {tot_mb:.1f} MB ({pct}%) — {file_info['name']}",
-                                    )
+                            now = time.time()
+                            if now - last_tick >= 0.8:
+                                last_tick = now
+                                dl_ratio = min(downloaded / float(orig_bytes), 1.0)
+                                with JOBS_LOCK:
+                                    item_progress[fid] = dl_ratio * max_dl_frac
+                                    active_tasks[f"dl_{fid}"] = f"📥 DL ({int(dl_ratio * 100)}%): {file_info['name'][:28]}"
+                                refresh_job_telemetry(job_id, item_progress, active_tasks, total_items)
+                    with JOBS_LOCK:
+                        item_progress[fid] = max_dl_frac
+                        active_tasks.pop(f"dl_{fid}", None)
+                        if job_id in ACTIVE_JOBS:
+                            ACTIVE_JOBS[job_id]["cached_on_ssd"] = ACTIVE_JOBS[job_id].get("cached_on_ssd", 0) + 1
+                    refresh_job_telemetry(job_id, item_progress, active_tasks, total_items)
                     return
 
                 if resp.status_code in (429, 500, 502, 503, 504):
                     time.sleep(2.0 * (attempt + 1))
                     continue
                 raise RuntimeError(f"HTTP {resp.status_code} downloading {file_info['name']}")
-    raise RuntimeError(f"HTTP 401/Timeout downloading {file_info['name']}: Tap Sign In with Google on Tab 2 and tap Retry Failed Files.")
+    raise RuntimeError(f"Failed downloading {file_info['name']} after retries.")
 
 
-def convert_video_ffmpeg_turbo(
+def convert_video_ffmpeg_hyper(
     src_path: Path,
     dst_path: Path,
     target_quality: str,
     duration_ms: int,
     job_id: str,
+    fid: str,
     file_name: str,
     item_idx: int,
     total_items: int,
+    item_progress: Dict[str, float],
+    active_tasks: Dict[str, str],
 ):
     preset = QUALITY_PRESETS[target_quality]
     h = preset["height"]
@@ -461,81 +544,94 @@ def convert_video_ffmpeg_turbo(
     target_fps = preset["fps"]
     total_sec = max(duration_ms / 1000.0, 1.0)
 
-    update_live_progress(
-        job_id,
-        item_idx,
-        total_items,
-        0.26,
-        f"[{item_idx}/{total_items}] ⚡ Turbo 4-CPU FFmpeg ({target_quality}): 0% — {file_name}",
-    )
-
-    # Cap FPS and use fastest x264 motion parameters for 4x speed boost on whiteboard lectures
-    vf_chain = f"fps='min(source_fps,{target_fps})',scale=-2:'min(ih,{h})':flags=fast_bilinear"
+    vf_chain = f"fps={target_fps},scale=-2:'min(ih,{h})':flags=fast_bilinear"
     v_codec = [
         "-c:v", "libx264",
         "-preset", "ultrafast",
         "-tune", "fastdecode",
-        "-crf", "29",
+        "-crf", "30",
         "-b:v", f"{v_kbps}k",
         "-maxrate", f"{int(v_kbps * 1.25)}k",
         "-bufsize", f"{v_kbps * 2}k",
-        "-x264-params", "ref=1:subme=0:me=dia:trellis=0:partitions=none:weightp=0:bframes=0:rc-lookahead=0",
-        "-threads", "0",
+        "-x264-params", "ref=1:subme=0:me=dia:trellis=0:partitions=none:weightp=0:bframes=0:rc-lookahead=0:aq-mode=0",
+        "-threads", "2",
     ]
 
-    cmd = [
+    # Tier 1 (Hyper Mode): Fast decoder flags (-skip_loop_filter all -skip_frame noref) + 0-CPU Audio Stream Copy (-c:a copy)
+    tier1_cmd = [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-        "-threads", "0",
+        "-threads", "2",
+        "-flags2", "+fast",
+        "-skip_loop_filter", "all",
+        "-skip_frame", "noref",
         "-i", str(src_path),
         "-vf", vf_chain,
         *v_codec,
-        "-c:a", "aac", "-b:a", f"{a_kbps}k", "-ac", "1", "-ar", "32000",
+        "-c:a", "copy",
         "-movflags", "+faststart",
         "-progress", "pipe:1", "-nostats",
         str(dst_path),
     ]
 
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        bufsize=1,
-    )
+    # Tier 2 (Safe Fallback): Standard input decoding + fast AAC audio coder if source audio wasn't MP4-compatible
+    tier2_cmd = [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "-threads", "2",
+        "-flags2", "+fast",
+        "-skip_loop_filter", "all",
+        "-i", str(src_path),
+        "-vf", vf_chain,
+        *v_codec,
+        "-c:a", "aac", "-aac_coder", "fast", "-b:a", f"{a_kbps}k", "-ac", "1",
+        "-movflags", "+faststart",
+        "-progress", "pipe:1", "-nostats",
+        str(dst_path),
+    ]
 
-    last_tick = 0.0
-    speed_str = ""
-    if proc.stdout:
-        for line in proc.stdout:
-            if job_id in CANCEL_FLAGS:
-                proc.kill()
-                raise RuntimeError("Job cancelled by user.")
-            sline = line.strip()
-            if sline.startswith("speed="):
-                speed_str = sline.split("=")[1].strip()
-            elif sline.startswith("out_time_ms=") or sline.startswith("out_time_us="):
-                val_str = sline.split("=")[1].strip()
-                if val_str.isdigit():
-                    cur_sec = int(val_str) / 1_000_000.0
-                    now = time.time()
-                    if now - last_tick >= 1.0:
-                        last_tick = now
-                        enc_ratio = min(cur_sec / total_sec, 0.99)
-                        item_frac = 0.25 + (enc_ratio * 0.75)
-                        pct = int(enc_ratio * 100)
-                        spd_info = f" [{speed_str}]" if speed_str else ""
-                        update_live_progress(
-                            job_id,
-                            item_idx,
-                            total_items,
-                            item_frac,
-                            f"[{item_idx}/{total_items}] ⚡ FFmpeg {target_quality}: {pct}%{spd_info} ({fmt_hms(cur_sec)} / {fmt_hms(total_sec)}) — {file_name}",
-                        )
+    for cmd in (tier1_cmd, tier2_cmd):
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
 
-    proc.wait()
-    if proc.returncode != 0:
-        err_txt = proc.stderr.read() if proc.stderr else "Unknown error"
-        raise RuntimeError(f"FFmpeg error: {err_txt[-300:]}")
+        last_tick = 0.0
+        speed_str = ""
+        if proc.stdout:
+            for line in proc.stdout:
+                if job_id in CANCEL_FLAGS:
+                    proc.kill()
+                    raise RuntimeError("Job cancelled by user.")
+                sline = line.strip()
+                if sline.startswith("speed="):
+                    speed_str = sline.split("=")[1].strip()
+                elif sline.startswith("out_time_ms=") or sline.startswith("out_time_us="):
+                    val_str = sline.split("=")[1].strip()
+                    if val_str.isdigit():
+                        cur_sec = int(val_str) / 1_000_000.0
+                        now = time.time()
+                        if now - last_tick >= 0.9:
+                            last_tick = now
+                            enc_ratio = min(cur_sec / total_sec, 0.99)
+                            pct = int(enc_ratio * 100)
+                            spd_info = f" [{speed_str}]" if speed_str else ""
+                            with JOBS_LOCK:
+                                item_progress[fid] = 0.25 + (enc_ratio * 0.75)
+                                active_tasks[f"enc_{fid}"] = (
+                                    f"⚡ [{item_idx}/{total_items}] {pct}%{spd_info}: {file_name[:26]}"
+                                )
+                            refresh_job_telemetry(job_id, item_progress, active_tasks, total_items)
+
+        proc.wait()
+        with JOBS_LOCK:
+            active_tasks.pop(f"enc_{fid}", None)
+        if proc.returncode == 0 and dst_path.exists() and dst_path.stat().st_size > 0:
+            return
+        dst_path.unlink(missing_ok=True)
+
+    raise RuntimeError(f"FFmpeg conversion failed on {file_name}")
 
 
 def run_conversion_and_zip_job(
@@ -576,6 +672,9 @@ def run_conversion_and_zip_job(
         all_items.append({**v, "is_video": True, "target_quality": q_target})
 
     total_items = max(len(all_items), 1)
+    item_progress: Dict[str, float] = {it["id"]: 0.0 for it in all_items}
+    active_tasks: Dict[str, str] = {}
+
     with JOBS_LOCK:
         ACTIVE_JOBS[job_id]["total_files"] = len(all_items)
         ACTIVE_JOBS[job_id]["state"] = "CONVERTING"
@@ -584,49 +683,67 @@ def run_conversion_and_zip_job(
         ACTIVE_JOBS[job_id]["file_results"] = []
         ACTIVE_JOBS[job_id]["actual_bytes_so_far"] = 0
         ACTIVE_JOBS[job_id]["processed_files"] = 0
+        ACTIVE_JOBS[job_id]["cached_on_ssd"] = 0
 
-    # Background Prefetch Pool: Downloads the next video while FFmpeg encodes the current video!
-    prefetch_pool = ThreadPoolExecutor(max_workers=2)
-    prefetch_futures = {}
+    # STAGE 1: AGGRESSIVE PARALLEL CLOUD SSD PRE-DOWNLOADER (3 parallel 16-stream aria2c workers)
+    # Downloads all PDFs & raw videos to Cloud SSD immediately while Google OAuth token is 100% fresh!
+    dl_pool = ThreadPoolExecutor(max_workers=3)
+    dl_futures = {}
 
-    def prefetch_raw_video(it: dict, idx_num: int) -> Path:
-        t_src = tmp_tree / f"{it['id']}_raw"
-        if t_src.exists() and t_src.stat().st_size > 0:
-            return t_src
-        download_drive_file_fast(
-            it, t_src, headers, base_params, job_id, idx_num, total_items,
-            is_transcode=True, api_key=api_key, update_ui=False
-        )
-        return t_src
-
-    for idx, item in enumerate(all_items, start=1):
-        if job_id in CANCEL_FLAGS:
-            prefetch_pool.shutdown(wait=False)
-            with JOBS_LOCK:
-                ACTIVE_JOBS[job_id]["state"] = "FAILED"
-                ACTIVE_JOBS[job_id]["current_file"] = "🛑 Cancelled by user."
-            return
-
-        # Trigger background prefetch for the NEXT 2 videos so they are already on disk when FFmpeg finishes!
-        for lookahead in (idx, idx + 1):
-            if lookahead < len(all_items):
-                nxt = all_items[lookahead]
-                nxt_fid = nxt["id"]
-                nxt_q = nxt["target_quality"]
-                if nxt["is_video"] and nxt_q != "Original" and nxt_fid not in completed_ids and nxt_fid not in prefetch_futures:
-                    prefetch_futures[nxt_fid] = prefetch_pool.submit(prefetch_raw_video, nxt, lookahead + 1)
-
+    def download_worker(idx_num: int, item: dict) -> Path:
         fid = item["id"]
         rel_path = item["rel_path"]
         is_vid = item["is_video"]
         q_target = item["target_quality"]
+        final_rel = f"{os.path.splitext(rel_path)[0]}.mp4" if (is_vid and q_target != "Original") else rel_path
+        final_dest = out_tree / final_rel
 
-        if is_vid and q_target != "Original":
-            base_no_ext, _ = os.path.splitext(rel_path)
-            final_rel = f"{base_no_ext}.mp4"
+        if fid in completed_ids and completed_ids[fid].get("quality") == q_target and final_dest.exists() and final_dest.stat().st_size > 0:
+            with JOBS_LOCK:
+                item_progress[fid] = 1.0
+                if job_id in ACTIVE_JOBS:
+                    ACTIVE_JOBS[job_id]["cached_on_ssd"] = ACTIVE_JOBS[job_id].get("cached_on_ssd", 0) + 1
+            return final_dest
+
+        # Wait briefly only if free disk space drops below 4 GB on massive >65 GB folders
+        while True:
+            if job_id in CANCEL_FLAGS:
+                raise RuntimeError("Job cancelled by user.")
+            _, _, free_b = shutil.disk_usage(WORK_DIR)
+            if free_b > 4 * (1024 ** 3):
+                break
+            time.sleep(2.0)
+
+        if not is_vid or q_target == "Original":
+            download_drive_file_aria2_or_httpx(
+                item, final_dest, headers, base_params, job_id, idx_num, total_items,
+                is_transcode=False, api_key=api_key, item_progress=item_progress, active_tasks=active_tasks
+            )
+            return final_dest
         else:
-            final_rel = rel_path
+            tmp_src = tmp_tree / f"{fid}_raw"
+            if tmp_src.exists() and tmp_src.stat().st_size > 0:
+                with JOBS_LOCK:
+                    item_progress[fid] = 0.25
+                    if job_id in ACTIVE_JOBS:
+                        ACTIVE_JOBS[job_id]["cached_on_ssd"] = ACTIVE_JOBS[job_id].get("cached_on_ssd", 0) + 1
+                return tmp_src
+            download_drive_file_aria2_or_httpx(
+                item, tmp_src, headers, base_params, job_id, idx_num, total_items,
+                is_transcode=True, api_key=api_key, item_progress=item_progress, active_tasks=active_tasks
+            )
+            return tmp_src
 
+    for idx, it in enumerate(all_items, start=1):
+        dl_futures[it["id"]] = dl_pool.submit(download_worker, idx, it)
+
+    # STAGE 2: DUAL-PARALLEL HYPER FFMPEG ENGINE (2 simultaneous video conversions across 4 vCPUs)
+    def process_item_complete(idx_num: int, item: dict) -> dict:
+        fid = item["id"]
+        rel_path = item["rel_path"]
+        is_vid = item["is_video"]
+        q_target = item["target_quality"]
+        final_rel = f"{os.path.splitext(rel_path)[0]}.mp4" if (is_vid and q_target != "Original") else rel_path
         final_dest = out_tree / final_rel
         final_dest.parent.mkdir(parents=True, exist_ok=True)
 
@@ -634,54 +751,41 @@ def run_conversion_and_zip_job(
         if is_vid and q_target in QUALITY_PRESETS:
             est_bytes = item["qualities"].get(q_target, {}).get("bytes", item["orig_size"])
 
-        try:
-            # Instant Checkpoint Skip for already-completed files
-            if fid in completed_ids and completed_ids[fid].get("quality") == q_target and final_dest.exists() and final_dest.stat().st_size > 0:
-                actual_sz = final_dest.stat().st_size
-                res_entry = {
-                    "id": fid, "name": item["name"], "rel_path": final_rel, "is_video": is_vid,
-                    "quality": q_target, "orig_bytes": item["orig_size"], "estimated_bytes": est_bytes,
-                    "actual_bytes": actual_sz, "action": "cached (checkpoint)", "skipped": True,
-                }
-            else:
-                if not item.get("can_download", True):
-                    raise RuntimeError(f"Download restricted: {item['name']}")
+        if fid in completed_ids and completed_ids[fid].get("quality") == q_target and final_dest.exists() and final_dest.stat().st_size > 0:
+            actual_sz = final_dest.stat().st_size
+            with JOBS_LOCK:
+                item_progress[fid] = 1.0
+            return {
+                "idx": idx_num, "id": fid, "name": item["name"], "rel_path": final_rel, "is_video": is_vid,
+                "quality": q_target, "orig_bytes": item["orig_size"], "estimated_bytes": est_bytes,
+                "actual_bytes": actual_sz, "action": "cached (checkpoint)", "skipped": True,
+            }
+
+        # Automatic 3-attempt full retry per file so transient errors never break a folder!
+        last_err = None
+        for attempt in range(3):
+            if job_id in CANCEL_FLAGS:
+                raise RuntimeError("Job cancelled by user.")
+            try:
+                if attempt == 0:
+                    dl_path = dl_futures[fid].result()
+                else:
+                    dl_path = download_worker(idx_num, item)
 
                 if not is_vid or q_target == "Original":
-                    download_drive_file_fast(
-                        item, final_dest, headers, base_params, job_id, idx, total_items,
-                        is_transcode=False, api_key=api_key, update_ui=True
-                    )
                     action_label = "copied original"
                 else:
                     q_info = item["qualities"].get(q_target, {})
                     needs_transcode = not q_info.get("is_copy", False)
-                    tmp_src = tmp_tree / f"{fid}_raw"
+                    tmp_src = dl_path
                     tmp_out = tmp_tree / f"{fid}_conv.mp4"
                     try:
-                        if fid in prefetch_futures:
-                            update_live_progress(
-                                job_id, idx, total_items, 0.15,
-                                f"[{idx}/{total_items}] 📥 Finishing background prefetch: {item['name']}..."
-                            )
-                            try:
-                                prefetch_futures[fid].result()
-                            except Exception:
-                                download_drive_file_fast(
-                                    item, tmp_src, headers, base_params, job_id, idx, total_items,
-                                    is_transcode=needs_transcode, api_key=api_key, update_ui=True
-                                )
-                        else:
-                            download_drive_file_fast(
-                                item, tmp_src, headers, base_params, job_id, idx, total_items,
-                                is_transcode=needs_transcode, api_key=api_key, update_ui=True
-                            )
-
                         if needs_transcode:
-                            convert_video_ffmpeg_turbo(
+                            convert_video_ffmpeg_hyper(
                                 tmp_src, tmp_out, q_target,
                                 int(item.get("duration_ms", 0) or 0),
-                                job_id, item["name"], idx, total_items
+                                job_id, fid, item["name"], idx_num, total_items,
+                                item_progress=item_progress, active_tasks=active_tasks
                             )
                             if tmp_out.stat().st_size < tmp_src.stat().st_size:
                                 shutil.move(str(tmp_out), str(final_dest))
@@ -697,29 +801,49 @@ def run_conversion_and_zip_job(
                         tmp_out.unlink(missing_ok=True)
 
                 actual_sz = final_dest.stat().st_size
-                completed_ids[fid] = {"quality": q_target, "actual_bytes": actual_sz}
-                ckpt_file.write_text(json.dumps(completed_ids))
+                with JOBS_LOCK:
+                    item_progress[fid] = 1.0
+                    completed_ids[fid] = {"quality": q_target, "actual_bytes": actual_sz}
+                    ckpt_file.write_text(json.dumps(completed_ids))
 
-                res_entry = {
-                    "id": fid, "name": item["name"], "rel_path": final_rel, "is_video": is_vid,
+                return {
+                    "idx": idx_num, "id": fid, "name": item["name"], "rel_path": final_rel, "is_video": is_vid,
                     "quality": q_target, "orig_bytes": item["orig_size"], "estimated_bytes": est_bytes,
                     "actual_bytes": actual_sz, "action": action_label, "skipped": False,
                 }
+            except Exception as e:
+                last_err = e
+                time.sleep(2.0 * (attempt + 1))
 
-            with JOBS_LOCK:
-                ACTIVE_JOBS[job_id]["processed_files"] += 1
-                ACTIVE_JOBS[job_id]["overall_percent"] = round((ACTIVE_JOBS[job_id]["processed_files"] / float(total_items)) * 100.0, 1)
-                ACTIVE_JOBS[job_id]["actual_bytes_so_far"] += res_entry["actual_bytes"]
-                ACTIVE_JOBS[job_id]["file_results"].append(res_entry)
+        raise RuntimeError(str(last_err))
 
-        except Exception as e:
-            with JOBS_LOCK:
-                ACTIVE_JOBS[job_id]["failed_count"] = ACTIVE_JOBS[job_id].get("failed_count", 0) + 1
-                ACTIVE_JOBS[job_id]["errors"].append(f"{item['name']}: {str(e)}")
+    with ThreadPoolExecutor(max_workers=2) as enc_pool:
+        enc_futures = {enc_pool.submit(process_item_complete, idx, it): it for idx, it in enumerate(all_items, start=1)}
+        for fut in as_completed(enc_futures):
+            it_meta = enc_futures[fut]
+            try:
+                res_entry = fut.result()
+                with JOBS_LOCK:
+                    ACTIVE_JOBS[job_id]["processed_files"] += 1
+                    ACTIVE_JOBS[job_id]["actual_bytes_so_far"] += res_entry["actual_bytes"]
+                    ACTIVE_JOBS[job_id]["file_results"].append(res_entry)
+                    ACTIVE_JOBS[job_id]["file_results"].sort(key=lambda x: x.get("idx", 0))
+                refresh_job_telemetry(job_id, item_progress, active_tasks, total_items)
+            except Exception as e:
+                with JOBS_LOCK:
+                    ACTIVE_JOBS[job_id]["failed_count"] = ACTIVE_JOBS[job_id].get("failed_count", 0) + 1
+                    ACTIVE_JOBS[job_id]["errors"].append(f"{it_meta['name']}: {str(e)}")
+                refresh_job_telemetry(job_id, item_progress, active_tasks, total_items)
 
-    prefetch_pool.shutdown(wait=False)
+    dl_pool.shutdown(wait=False)
 
-    # STEP 3: PACKAGE CONVERTED FILES INTO UNIFIED ZIP64 (KEEPING out_tree FILES INTACT FOR RETRIES!)
+    if job_id in CANCEL_FLAGS:
+        with JOBS_LOCK:
+            ACTIVE_JOBS[job_id]["state"] = "FAILED"
+            ACTIVE_JOBS[job_id]["current_file"] = "🛑 Cancelled by user."
+        return
+
+    # STAGE 3: PACKAGE CONVERTED FILES INTO UNIFIED ZIP64 (KEEPING out_tree FILES INTACT FOR RETRIES!)
     try:
         zip_filename = f"{sanitize_filename(scan_data['title'])}_{bulk_quality}.zip"
         zip_path = job_dir / zip_filename
@@ -727,7 +851,7 @@ def run_conversion_and_zip_job(
             ACTIVE_JOBS[job_id]["state"] = "PACKAGING_ZIP"
             ACTIVE_JOBS[job_id]["current_file"] = f"📦 Packaging unified ZIP64 archive ({zip_filename})..."
 
-        all_converted_files = [p for p in out_tree.rglob("*") if p.is_file()]
+        all_converted_files = sorted([p for p in out_tree.rglob("*") if p.is_file()])
         with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
             for f_idx, f_path in enumerate(all_converted_files, start=1):
                 arcname = str(f_path.relative_to(out_tree))
@@ -736,7 +860,6 @@ def run_conversion_and_zip_job(
                         f"📦 Writing to ZIP64 ({f_idx}/{len(all_converted_files)}): {arcname}"
                     )
                 zf.write(f_path, arcname)
-                # IMPORTANT: We DO NOT delete f_path here so failed-file retries never lose completed files!
 
         zip_final_bytes = zip_path.stat().st_size if zip_path.exists() else 0
         with JOBS_LOCK:
@@ -784,13 +907,13 @@ class RefreshTokenRequest(BaseModel):
 
 @app.get("/")
 def root():
-    return {"service": "DriveZip Pro Cloud Backend", "milestone": 10, "status": "online"}
+    return {"service": "DriveZip Pro Cloud Backend", "milestone": 11, "status": "online", "aria2c": HAS_ARIA2C}
 
 
 @app.get("/api/v1/health")
 def health(_: bool = Depends(verify_key)):
     _, _, free = shutil.disk_usage(WORK_DIR)
-    return {"authenticated": True, "milestone": 10, "disk_free_gb": round(free / (1024 ** 3), 2)}
+    return {"authenticated": True, "milestone": 11, "disk_free_gb": round(free / (1024 ** 3), 2), "aria2c": HAS_ARIA2C}
 
 
 @app.post("/api/v1/inspect")
@@ -866,10 +989,11 @@ def start_job(req: StartJobRequest, _: bool = Depends(verify_key)):
             "bulk_quality": req.bulk_quality,
             "state": "STARTING",
             "processed_files": 0,
+            "cached_on_ssd": 0,
             "failed_count": 0,
             "total_files": scan_data["total_files"],
             "overall_percent": 0.0,
-            "current_file": "Starting Turbo 4-CPU FFmpeg + Background Prefetch Engine...",
+            "current_file": "Launching 16x aria2c SSD Prefetcher + Dual Hyper FFmpeg Engine...",
             "estimated_total_bytes": est_total,
             "actual_bytes_so_far": 0,
             "file_results": [],
