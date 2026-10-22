@@ -1,6 +1,7 @@
 package com.drivezip.downloader
 
 import android.accounts.Account
+import android.accounts.AccountManager
 import android.app.Activity
 import android.content.ClipData
 import android.content.ClipboardManager
@@ -34,9 +35,7 @@ import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import com.google.android.gms.auth.GoogleAuthUtil
 import com.google.android.gms.auth.UserRecoverableAuthException
-import com.google.android.gms.auth.api.signin.GoogleSignIn
-import com.google.android.gms.auth.api.signin.GoogleSignInOptions
-import com.google.android.gms.common.api.Scope
+import com.google.android.gms.common.AccountPicker
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -61,7 +60,7 @@ class MainActivity : ComponentActivity() {
         setContent {
             MaterialTheme {
                 Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-                    MilestoneFiveScreen()
+                    MilestoneSixScreen()
                 }
             }
         }
@@ -183,7 +182,7 @@ data class ConvertedFileResult(
 )
 
 @Composable
-fun MilestoneFiveScreen() {
+fun MilestoneSixScreen() {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val prefs = remember { getSecurePrefs(context) }
@@ -329,32 +328,34 @@ fun MilestoneFiveScreen() {
                             appliedOauthToken = token
                             draftOauthToken = token
                             prefs.edit().putString("oauth_token", token).apply()
-                            statusBanner = "Google Drive Permission Granted! OAuth Token Applied."
+                            statusBanner = "✅ Google Drive Permission Granted! OAuth Token Applied for ${acct.name}"
                             Toast.makeText(context, "Google Drive Authorized!", Toast.LENGTH_SHORT).show()
                         }
                     } catch (e: Exception) {
                         withContext(Dispatchers.Main) {
-                            statusBanner = "Token error after consent: ${e.message}"
+                            statusBanner = "❌ Token error after consent: ${e.message}"
                         }
                     }
                 }
             }
         } else {
-            statusBanner = "Google Drive permission request was cancelled."
+            statusBanner = "⚠️ Google Drive permission screen was cancelled."
         }
     }
 
-    val signInLauncher = rememberLauncherForActivityResult(
+    // Native AccountPicker Launcher (Bypasses GoogleSignIn ApiException 10 completely!)
+    val accountPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartActivityForResult()
     ) { result ->
-        val task = GoogleSignIn.getSignedInAccountFromIntent(result.data)
-        try {
-            val account = task.result
-            val acct: Account? = account.account
-            if (acct != null) {
-                signedInEmail = account.email ?: "Signed In"
-                prefs.edit().putString("signed_in_email", signedInEmail).apply()
+        if (result.resultCode == Activity.RESULT_OK && result.data != null) {
+            val email = result.data?.getStringExtra(AccountManager.KEY_ACCOUNT_NAME) ?: ""
+            val type = result.data?.getStringExtra(AccountManager.KEY_ACCOUNT_TYPE) ?: "com.google"
+            if (email.isNotBlank()) {
+                val acct = Account(email, type)
+                signedInEmail = email
+                prefs.edit().putString("signed_in_email", email).apply()
                 pendingAccount = acct
+                statusBanner = "Requesting Google Drive token for $email..."
                 scope.launch(Dispatchers.IO) {
                     try {
                         val token = GoogleAuthUtil.getToken(
@@ -366,8 +367,8 @@ fun MilestoneFiveScreen() {
                             appliedOauthToken = token
                             draftOauthToken = token
                             prefs.edit().putString("oauth_token", token).apply()
-                            statusBanner = "Signed in as $signedInEmail (OAuth Token Applied)"
-                            Toast.makeText(context, "Signed in: $signedInEmail", Toast.LENGTH_SHORT).show()
+                            statusBanner = "✅ Signed in as $email! OAuth Token Auto-Applied."
+                            Toast.makeText(context, "Signed in: $email", Toast.LENGTH_SHORT).show()
                         }
                     } catch (re: UserRecoverableAuthException) {
                         val consentIntent: Intent? = re.intent
@@ -376,22 +377,22 @@ fun MilestoneFiveScreen() {
                                 statusBanner = "Opening Google Drive permission screen—tap Allow..."
                                 recoveryLauncher.launch(consentIntent)
                             } else {
-                                statusBanner = "Consent screen intent was null."
+                                statusBanner = "❌ Consent screen intent was null."
                             }
                         }
                     } catch (e: Exception) {
                         withContext(Dispatchers.Main) {
-                            statusBanner = "OAuth Token Error: ${e.message}"
+                            statusBanner = "❌ OAuth Error (${e.javaClass.simpleName}): ${e.message}\nMake sure SHA-1 (31:4D:B5...) is saved in Google Cloud Console!"
+                            Toast.makeText(context, "Auth Error: ${e.message}", Toast.LENGTH_LONG).show()
                         }
                     }
                 }
             }
-        } catch (e: Exception) {
-            statusBanner = "Google Sign-In failed: ${e.message}"
+        } else {
+            statusBanner = "⚠️ Account selection cancelled."
         }
     }
 
-    // Auto-sync live backend URL & Auto-reconnect to any running or completed cloud job on startup
     LaunchedEffect(Unit) {
         var activeUrl = appliedBackendUrl
         if (activeUrl.isBlank()) {
@@ -433,6 +434,20 @@ fun MilestoneFiveScreen() {
                 .padding(20.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
+            // GLOBAL LIVE STATUS BANNER (Visible on BOTH Tab 1 and Tab 2!)
+            Surface(
+                color = MaterialTheme.colorScheme.secondaryContainer,
+                shape = MaterialTheme.shapes.small,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text(
+                    text = "Live Status: $statusBanner",
+                    modifier = Modifier.padding(12.dp),
+                    fontFamily = FontFamily.Monospace,
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+
             if (selectedTab == 0) {
                 // SCANNER INPUT CARD
                 Card(modifier = Modifier.fillMaxWidth()) {
@@ -508,14 +523,6 @@ fun MilestoneFiveScreen() {
                             modifier = Modifier.fillMaxWidth().height(52.dp)
                         ) {
                             Text(if (isBusy) "Scanning All Subfolders..." else "🔍 Scan Folder Recursively & Calculate Sizes")
-                        }
-
-                        Surface(
-                            color = MaterialTheme.colorScheme.surfaceVariant,
-                            shape = MaterialTheme.shapes.small,
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Text(text = statusBanner, modifier = Modifier.padding(12.dp), fontFamily = FontFamily.Monospace)
                         }
                     }
                 }
@@ -767,7 +774,7 @@ fun MilestoneFiveScreen() {
                     }
                 }
 
-                // LIVE CONVERSION, PACKAGING & RESUMABLE DOWNLOAD CARD (Visible even after app restart)
+                // LIVE CONVERSION, PACKAGING & RESUMABLE DOWNLOAD CARD
                 if (jobState.isNotBlank()) {
                     Card(modifier = Modifier.fillMaxWidth()) {
                         Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -819,7 +826,6 @@ fun MilestoneFiveScreen() {
                                 )
                             }
 
-                            // RESUMABLE CHUNKED DOWNLOAD TO TABLET
                             if (zipReady && activeJobId.isNotBlank()) {
                                 Divider()
                                 Text(
@@ -963,7 +969,7 @@ fun MilestoneFiveScreen() {
                                 onClick = {
                                     isBusy = true
                                     scope.launch {
-                                        statusBanner = "Restarting 4-CPU GitHub Cloud Server with Milestone 5 code (~45s)..."
+                                        statusBanner = "Restarting 4-CPU GitHub Cloud Server (~45s)..."
                                         val triggered = triggerGitHubBackendWorkflow(appliedGhRepo, appliedGhPat)
                                         if (!triggered) {
                                             statusBanner = "Could not trigger via token. Start 'Run DriveZip Cloud Backend' in GitHub Actions."
@@ -1100,7 +1106,7 @@ fun MilestoneFiveScreen() {
                             onClick = {
                                 appliedDriveApiKey = draftDriveApiKey
                                 prefs.edit().putString("drive_api_key", appliedDriveApiKey).apply()
-                                statusBanner = "Applied Google Drive API Key."
+                                statusBanner = "✅ Applied Google Drive API Key."
                                 Toast.makeText(context, "Google Drive API Key Applied!", Toast.LENGTH_SHORT).show()
                             },
                             modifier = Modifier.fillMaxWidth()
@@ -1112,13 +1118,14 @@ fun MilestoneFiveScreen() {
                         Text("Option B — Private & 'Shared with me' Folders (OAuth 2.0):", fontWeight = FontWeight.SemiBold)
                         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                             Button(onClick = {
-                                val gso = GoogleSignInOptions.Builder(GoogleSignInOptions.DEFAULT_SIGN_IN)
-                                    .requestEmail()
-                                    .requestScopes(Scope("https://www.googleapis.com/auth/drive.readonly"))
-                                    .build()
-                                signInLauncher.launch(GoogleSignIn.getClient(context, gso).signInIntent)
+                                val intent = AccountPicker.newChooseAccountIntent(
+                                    AccountPicker.AccountChooserOptions.Builder()
+                                        .setAllowableAccountsTypes(listOf("com.google"))
+                                        .build()
+                                )
+                                accountPickerLauncher.launch(intent)
                             }) {
-                                Text(if (signedInEmail.isBlank()) "🔐 Sign In with Google" else "Signed In: $signedInEmail")
+                                Text(if (signedInEmail.isBlank()) "🔐 Sign In with Google" else "✅ Signed In: $signedInEmail")
                             }
 
                             if (signedInEmail.isNotBlank() || appliedOauthToken.isNotBlank()) {
@@ -1145,7 +1152,7 @@ fun MilestoneFiveScreen() {
                             onClick = {
                                 appliedOauthToken = draftOauthToken
                                 prefs.edit().putString("oauth_token", appliedOauthToken).apply()
-                                statusBanner = "Applied OAuth 2.0 Access Token."
+                                statusBanner = "✅ Applied OAuth 2.0 Access Token."
                                 Toast.makeText(context, "OAuth Token Applied!", Toast.LENGTH_SHORT).show()
                             },
                             modifier = Modifier.fillMaxWidth()
@@ -1189,7 +1196,7 @@ private suspend fun downloadZipResumableToTablet(
         }
 
         val cleanUrl = rawUrl.trimEnd('/')
-        val chunkSize = 16L * 1024L * 1024L // 16 MB per HTTP Range chunk
+        val chunkSize = 16L * 1024L * 1024L
         val client = buildHttpClient()
 
         while (downloaded < totalBytes || totalBytes == 0L) {
