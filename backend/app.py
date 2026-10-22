@@ -14,7 +14,7 @@ from fastapi import FastAPI, Header, HTTPException, Depends, Request
 from fastapi.responses import FileResponse, StreamingResponse, Response
 from pydantic import BaseModel
 
-app = FastAPI(title="DriveZip Pro Cloud Backend", version="7.0.0")
+app = FastAPI(title="DriveZip Pro Cloud Backend", version="9.0.0")
 
 BACKEND_API_KEY = os.environ.get("BACKEND_API_KEY", "drivezip2026secret")
 WORK_DIR = Path("/tmp/drivezip_jobs")
@@ -85,7 +85,11 @@ def extract_drive_id(link_or_id: str) -> str:
 
 def build_drive_auth(oauth_token: str, api_key: str):
     headers = {}
-    params = {"supportsAllDrives": "true", "includeItemsFromAllDrives": "true"}
+    params = {
+        "supportsAllDrives": "true",
+        "includeItemsFromAllDrives": "true",
+        "corpora": "allDrives",
+    }
     if oauth_token.strip():
         headers["Authorization"] = f"Bearer {oauth_token.strip()}"
     elif api_key.strip():
@@ -93,7 +97,7 @@ def build_drive_auth(oauth_token: str, api_key: str):
     else:
         raise HTTPException(
             status_code=400,
-            detail="Missing Google Auth! In Tab 2, Sign In with Google or Apply your Drive API Key.",
+            detail="Missing Google Auth! Since this folder is 'Shared with you', you MUST Sign In with Google on Tab 2.",
         )
     return headers, params
 
@@ -104,7 +108,10 @@ def drive_api_get(client: httpx.Client, url: str, headers: dict, params: dict) -
         if resp.status_code == 200:
             return resp.json()
         if resp.status_code == 401:
-            raise HTTPException(status_code=401, detail="Google OAuth Token expired (HTTP 401). Please re-sign in on Tab 2.")
+            raise HTTPException(
+                status_code=401,
+                detail="Google OAuth Token expired (HTTP 401). Please go to Tab 2 and tap Sign In with Google again.",
+            )
         if resp.status_code in (429, 500, 502, 503, 504):
             time.sleep(1.5 * (attempt + 1))
             continue
@@ -119,8 +126,6 @@ def drive_api_get(client: httpx.Client, url: str, headers: dict, params: dict) -
 def probe_video_via_ffprobe(file_id: str, headers: dict, params: dict) -> Tuple[int, int, int]:
     try:
         dl_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media&supportsAllDrives=true"
-        if "key" in params:
-            dl_url += f"&key={params['key']}"
         cmd = [
             "ffprobe", "-v", "error",
             "-select_streams", "v:0",
@@ -177,7 +182,7 @@ def scan_drive_recursive(resource_id: str, oauth_token: str, api_key: str) -> di
             client,
             f"https://www.googleapis.com/drive/v3/files/{resource_id}",
             headers,
-            {**base_params, "fields": fields_single},
+            base_params,
         )
 
         if root_meta.get("mimeType") == "application/vnd.google-apps.shortcut":
@@ -187,7 +192,7 @@ def scan_drive_recursive(resource_id: str, oauth_token: str, api_key: str) -> di
                     client,
                     f"https://www.googleapis.com/drive/v3/files/{target_id}",
                     headers,
-                    {**base_params, "fields": fields_single},
+                    base_params,
                 )
 
         root_name = sanitize_filename(root_meta.get("name", "DriveItem"))
@@ -205,7 +210,7 @@ def scan_drive_recursive(resource_id: str, oauth_token: str, api_key: str) -> di
                         client,
                         f"https://www.googleapis.com/drive/v3/files/{t_id}",
                         headers,
-                        {**base_params, "fields": fields_single},
+                        base_params,
                     )
                     mime = item.get("mimeType", "")
                 except Exception:
@@ -281,8 +286,6 @@ def scan_drive_recursive(resource_id: str, oauth_token: str, api_key: str) -> di
                     **base_params,
                     "q": f"'{folder_id}' in parents and trashed = false",
                     "pageSize": 100,
-                    "fields": fields_list,
-                    "orderBy": "folder,name",
                 }
                 if page_token:
                     q_params["pageToken"] = page_token
@@ -358,7 +361,7 @@ def download_drive_file_with_progress(
         with httpx.Client(follow_redirects=True, timeout=180.0) as client:
             with client.stream("GET", url, headers=headers, params=params) as resp:
                 if resp.status_code == 401:
-                    raise RuntimeError("HTTP 401: Google OAuth Token expired. Please re-sign in on Tab 2.")
+                    raise RuntimeError("HTTP 401: Google OAuth Token expired. Please go to Tab 2 and re-sign in.")
                 if resp.status_code == 200:
                     downloaded = 0
                     last_tick = 0.0
@@ -415,30 +418,20 @@ def convert_video_ffmpeg_with_progress(
         f"[{item_idx}/{total_items}] ⚙️ Starting 4-CPU FFmpeg ({target_quality}): 0% — {file_name}",
     )
 
-    scale_filter = f"scale=-2:'min(ih,{h})'"
-    if HAS_GPU:
-        v_codec = [
-            "-c:v", "h264_nvenc",
-            "-preset", "p4",
-            "-b:v", f"{v_kbps}k",
-            "-maxrate", f"{int(v_kbps * 1.2)}k",
-            "-bufsize", f"{v_kbps * 2}k",
-        ]
-    else:
-        v_codec = [
-            "-c:v", "libx264",
-            "-preset", "ultrafast",
-            "-crf", "28",
-            "-b:v", f"{v_kbps}k",
-            "-maxrate", f"{int(v_kbps * 1.2)}k",
-            "-bufsize", f"{v_kbps * 2}k",
-            "-threads", "0",
-        ]
+    v_codec = [
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-crf", "28",
+        "-b:v", f"{v_kbps}k",
+        "-maxrate", f"{int(v_kbps * 1.2)}k",
+        "-bufsize", f"{v_kbps * 2}k",
+        "-threads", "0",
+    ]
 
     cmd = [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
         "-i", str(src_path),
-        "-vf", scale_filter,
+        "-vf", f"scale=-2:'min(ih,{h})'",
         *v_codec,
         "-c:a", "aac", "-b:a", f"{a_kbps}k", "-ac", "1",
         "-movflags", "+faststart",
@@ -671,13 +664,13 @@ class StartJobRequest(BaseModel):
 
 @app.get("/")
 def root():
-    return {"service": "DriveZip Pro Cloud Backend", "milestone": 7, "status": "online", "gpu": HAS_GPU}
+    return {"service": "DriveZip Pro Cloud Backend", "milestone": 9, "status": "online", "gpu": HAS_GPU}
 
 
 @app.get("/api/v1/health")
 def health(_: bool = Depends(verify_key)):
     total, used, free = shutil.disk_usage(WORK_DIR)
-    return {"authenticated": True, "milestone": 7, "disk_free_gb": round(free / (1024 ** 3), 2), "gpu": HAS_GPU}
+    return {"authenticated": True, "milestone": 9, "disk_free_gb": round(free / (1024 ** 3), 2), "gpu": HAS_GPU}
 
 
 @app.post("/api/v1/inspect")
