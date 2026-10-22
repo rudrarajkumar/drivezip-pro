@@ -114,7 +114,6 @@ def drive_api_get(client: httpx.Client, url: str, headers: dict, params: dict) -
 
 
 def probe_video_via_ffprobe(file_id: str, headers: dict, params: dict) -> Tuple[int, int, int]:
-    """Fallback duration/resolution probe over HTTP Range if Drive videoMediaMetadata is empty."""
     try:
         dl_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media&supportsAllDrives=true"
         if "key" in params:
@@ -349,7 +348,6 @@ def convert_video_ffmpeg(src_path: Path, dst_path: Path, target_quality: str):
     v_kbps = preset["v_kbps"]
     a_kbps = preset["a_kbps"]
 
-    # Scale height to target without upscaling; keep width divisible by 2
     scale_filter = f"scale=-2:'min(ih,{h})'"
     if HAS_GPU:
         v_codec = [
@@ -442,7 +440,6 @@ def run_conversion_job(
         if is_vid and q_target in QUALITY_PRESETS:
             est_bytes = item["qualities"].get(q_target, {}).get("bytes", item["orig_size"])
 
-        # Checkpointing: Skip if already processed at the same quality
         if fid in completed_ids and completed_ids[fid].get("quality") == q_target and final_dest.exists():
             actual_sz = final_dest.stat().st_size
             return {
@@ -481,7 +478,6 @@ def run_conversion_job(
                 download_drive_file(item, tmp_src, headers, base_params)
                 if needs_transcode:
                     convert_video_ffmpeg(tmp_src, tmp_out, q_target)
-                    # Never exceed original size: keep smaller file
                     if tmp_out.stat().st_size < tmp_src.stat().st_size:
                         shutil.move(str(tmp_out), str(final_dest))
                         action_label = f"converted to {q_target}"
@@ -513,7 +509,6 @@ def run_conversion_job(
             "skipped": False,
         }
 
-    # Process 2 files in parallel (2 workers * 2 FFmpeg threads = 4 CPU cores on GitHub VM)
     with ThreadPoolExecutor(max_workers=2) as pool:
         futures = {pool.submit(process_one_item, it): it for it in all_items}
         for fut in as_completed(futures):
