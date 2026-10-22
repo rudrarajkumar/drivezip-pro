@@ -14,7 +14,7 @@ from fastapi import FastAPI, Header, HTTPException, Depends, Request
 from fastapi.responses import FileResponse, StreamingResponse, Response
 from pydantic import BaseModel
 
-app = FastAPI(title="DriveZip Pro Cloud Backend", version="4.0.0")
+app = FastAPI(title="DriveZip Pro Cloud Backend", version="5.0.0")
 
 BACKEND_API_KEY = os.environ.get("BACKEND_API_KEY", "drivezip2026secret")
 WORK_DIR = Path("/tmp/drivezip_jobs")
@@ -36,6 +36,7 @@ WORKSPACE_EXPORTS = {
 
 JOBS_LOCK = threading.Lock()
 ACTIVE_JOBS: Dict[str, dict] = {}
+CANCEL_FLAGS: Set[str] = set()
 
 
 def verify_key(x_backend_key: str = Header(default="")):
@@ -323,6 +324,15 @@ def fmt_hms(sec: float) -> str:
     return f"{s // 3600:02d}:{(s % 3600) // 60:02d}:{s % 60:02d}"
 
 
+def update_live_progress(job_id: str, item_idx: int, total_items: int, item_fraction: float, message: str):
+    """Updates overall_percent smoothly from 0% to 100% even when converting a single video."""
+    overall = ((item_idx - 1 + max(0.0, min(item_fraction, 1.0))) / float(max(total_items, 1))) * 100.0
+    with JOBS_LOCK:
+        if job_id in ACTIVE_JOBS:
+            ACTIVE_JOBS[job_id]["overall_percent"] = round(min(overall, 99.5), 1)
+            ACTIVE_JOBS[job_id]["current_file"] = message
+
+
 def download_drive_file_with_progress(
     file_info: dict,
     dest_path: Path,
@@ -331,6 +341,7 @@ def download_drive_file_with_progress(
     job_id: str,
     item_idx: int,
     total_items: int,
+    is_transcode: bool,
 ):
     fid = file_info["id"]
     if file_info.get("is_workspace", False):
@@ -351,20 +362,26 @@ def download_drive_file_with_progress(
                     last_tick = 0.0
                     with open(dest_path, "wb") as f:
                         for chunk in resp.iter_bytes(chunk_size=1024 * 512):
+                            if job_id in CANCEL_FLAGS:
+                                raise RuntimeError("Job cancelled by user.")
                             f.write(chunk)
                             downloaded += len(chunk)
                             now = time.time()
-                            if now - last_tick >= 1.5:
+                            if now - last_tick >= 1.2:
                                 last_tick = now
-                                pct = min(int((downloaded * 100) / orig_bytes), 100)
+                                dl_ratio = min(downloaded / float(orig_bytes), 1.0)
+                                # If video needs transcoding, download represents first 30% of the item's work
+                                item_frac = dl_ratio * 0.30 if is_transcode else dl_ratio
+                                pct = int(dl_ratio * 100)
                                 dl_mb = downloaded / (1024 * 1024)
                                 tot_mb = orig_bytes / (1024 * 1024)
-                                with JOBS_LOCK:
-                                    if job_id in ACTIVE_JOBS:
-                                        ACTIVE_JOBS[job_id]["current_file"] = (
-                                            f"[{item_idx}/{total_items}] 📥 Cloud Downloading from Drive: "
-                                            f"{dl_mb:.1f} / {tot_mb:.1f} MB ({pct}%) — {file_info['name']}"
-                                        )
+                                update_live_progress(
+                                    job_id,
+                                    item_idx,
+                                    total_items,
+                                    item_frac,
+                                    f"[{item_idx}/{total_items}] 📥 Cloud Downloading from Drive: {dl_mb:.1f} / {tot_mb:.1f} MB ({pct}%) — {file_info['name']}",
+                                )
                     return
                 if resp.status_code in (429, 500, 502, 503, 504):
                     time.sleep(2.0 * (attempt + 1))
@@ -388,6 +405,14 @@ def convert_video_ffmpeg_with_progress(
     v_kbps = preset["v_kbps"]
     a_kbps = preset["a_kbps"]
     total_sec = max(duration_ms / 1000.0, 1.0)
+
+    update_live_progress(
+        job_id,
+        item_idx,
+        total_items,
+        0.31,
+        f"[{item_idx}/{total_items}] ⚙️ Starting 4-CPU FFmpeg ({target_quality}): 0% — {file_name}",
+    )
 
     scale_filter = f"scale=-2:'min(ih,{h})'"
     if HAS_GPU:
@@ -429,22 +454,33 @@ def convert_video_ffmpeg_with_progress(
     )
 
     last_tick = 0.0
+    speed_str = ""
     if proc.stdout:
         for line in proc.stdout:
-            if line.startswith("out_time_ms=") or line.startswith("out_time_us="):
-                val_str = line.strip().split("=")[1]
+            if job_id in CANCEL_FLAGS:
+                proc.kill()
+                raise RuntimeError("Job cancelled by user.")
+            sline = line.strip()
+            if sline.startswith("speed="):
+                speed_str = sline.split("=")[1].strip()
+            elif sline.startswith("out_time_ms=") or sline.startswith("out_time_us="):
+                val_str = sline.split("=")[1].strip()
                 if val_str.isdigit():
                     cur_sec = int(val_str) / 1_000_000.0
                     now = time.time()
-                    if now - last_tick >= 1.5:
+                    if now - last_tick >= 1.2:
                         last_tick = now
-                        pct = min(int((cur_sec / total_sec) * 100), 99)
-                        with JOBS_LOCK:
-                            if job_id in ACTIVE_JOBS:
-                                ACTIVE_JOBS[job_id]["current_file"] = (
-                                    f"[{item_idx}/{total_items}] ⚙️ FFmpeg Encoding {target_quality}: "
-                                    f"{pct}% ({fmt_hms(cur_sec)} / {fmt_hms(total_sec)}) — {file_name}"
-                                )
+                        enc_ratio = min(cur_sec / total_sec, 0.99)
+                        item_frac = 0.30 + (enc_ratio * 0.70)
+                        pct = int(enc_ratio * 100)
+                        spd_info = f" [{speed_str}]" if speed_str else ""
+                        update_live_progress(
+                            job_id,
+                            item_idx,
+                            total_items,
+                            item_frac,
+                            f"[{item_idx}/{total_items}] ⚙️ FFmpeg Encoding {target_quality}: {pct}%{spd_info} ({fmt_hms(cur_sec)} / {fmt_hms(total_sec)}) — {file_name}",
+                        )
 
     proc.wait()
     if proc.returncode != 0:
@@ -492,6 +528,12 @@ def run_conversion_and_zip_job(
         ACTIVE_JOBS[job_id]["state"] = "CONVERTING"
 
     for idx, item in enumerate(all_items, start=1):
+        if job_id in CANCEL_FLAGS:
+            with JOBS_LOCK:
+                ACTIVE_JOBS[job_id]["state"] = "FAILED"
+                ACTIVE_JOBS[job_id]["current_file"] = "🛑 Job cancelled by user."
+            return
+
         fid = item["id"]
         rel_path = item["rel_path"]
         is_vid = item["is_video"]
@@ -511,7 +553,6 @@ def run_conversion_and_zip_job(
             est_bytes = item["qualities"].get(q_target, {}).get("bytes", item["orig_size"])
 
         try:
-            # Checkpointing: Skip if already processed
             if fid in completed_ids and completed_ids[fid].get("quality") == q_target and final_dest.exists():
                 actual_sz = final_dest.stat().st_size
                 res_entry = {
@@ -524,7 +565,9 @@ def run_conversion_and_zip_job(
                     raise RuntimeError(f"Download restricted by file owner: {item['name']}")
 
                 if not is_vid or q_target == "Original":
-                    download_drive_file_with_progress(item, final_dest, headers, base_params, job_id, idx, total_items)
+                    download_drive_file_with_progress(
+                        item, final_dest, headers, base_params, job_id, idx, total_items, is_transcode=False
+                    )
                     action_label = "copied original"
                 else:
                     q_info = item["qualities"].get(q_target, {})
@@ -532,7 +575,9 @@ def run_conversion_and_zip_job(
                     tmp_src = tmp_tree / f"{fid}_raw"
                     tmp_out = tmp_tree / f"{fid}_conv.mp4"
                     try:
-                        download_drive_file_with_progress(item, tmp_src, headers, base_params, job_id, idx, total_items)
+                        download_drive_file_with_progress(
+                            item, tmp_src, headers, base_params, job_id, idx, total_items, is_transcode=needs_transcode
+                        )
                         if needs_transcode:
                             convert_video_ffmpeg_with_progress(
                                 tmp_src, tmp_out, q_target,
@@ -563,13 +608,14 @@ def run_conversion_and_zip_job(
                 }
 
             with JOBS_LOCK:
-                ACTIVE_JOBS[job_id]["processed_files"] += 1
+                ACTIVE_JOBS[job_id]["processed_files"] = idx
+                ACTIVE_JOBS[job_id]["overall_percent"] = round((idx / float(total_items)) * 100.0, 1)
                 ACTIVE_JOBS[job_id]["actual_bytes_so_far"] += res_entry["actual_bytes"]
                 ACTIVE_JOBS[job_id]["file_results"].append(res_entry)
 
         except Exception as e:
             with JOBS_LOCK:
-                ACTIVE_JOBS[job_id]["processed_files"] += 1
+                ACTIVE_JOBS[job_id]["processed_files"] = idx
                 ACTIVE_JOBS[job_id]["errors"].append(f"{item['name']}: {str(e)}")
 
     # STEP 3: PACKAGE ALL FILES INTO ONE UNIFIED ZIP64 PRESERVING FOLDER STRUCTURE
@@ -578,6 +624,7 @@ def run_conversion_and_zip_job(
         zip_path = job_dir / zip_filename
         with JOBS_LOCK:
             ACTIVE_JOBS[job_id]["state"] = "PACKAGING_ZIP"
+            ACTIVE_JOBS[job_id]["overall_percent"] = 99.5
             ACTIVE_JOBS[job_id]["current_file"] = f"📦 Packaging unified ZIP64 archive ({zip_filename})..."
 
         all_converted_files = [p for p in out_tree.rglob("*") if p.is_file()]
@@ -589,12 +636,12 @@ def run_conversion_and_zip_job(
                         f"📦 Adding to ZIP64 ({f_idx}/{len(all_converted_files)}): {arcname}"
                     )
                 zf.write(f_path, arcname)
-                # Free disk space immediately as files are added to ZIP64
                 f_path.unlink(missing_ok=True)
 
         zip_final_bytes = zip_path.stat().st_size if zip_path.exists() else 0
         with JOBS_LOCK:
             ACTIVE_JOBS[job_id]["state"] = "COMPLETED"
+            ACTIVE_JOBS[job_id]["overall_percent"] = 100.0
             ACTIVE_JOBS[job_id]["zip_ready"] = True
             ACTIVE_JOBS[job_id]["zip_filename"] = zip_filename
             ACTIVE_JOBS[job_id]["zip_size_bytes"] = zip_final_bytes
@@ -623,13 +670,13 @@ class StartJobRequest(BaseModel):
 
 @app.get("/")
 def root():
-    return {"service": "DriveZip Pro Cloud Backend", "milestone": 4, "status": "online", "gpu": HAS_GPU}
+    return {"service": "DriveZip Pro Cloud Backend", "milestone": 5, "status": "online", "gpu": HAS_GPU}
 
 
 @app.get("/api/v1/health")
 def health(_: bool = Depends(verify_key)):
     total, used, free = shutil.disk_usage(WORK_DIR)
-    return {"authenticated": True, "milestone": 4, "disk_free_gb": round(free / (1024 ** 3), 2), "gpu": HAS_GPU}
+    return {"authenticated": True, "milestone": 5, "disk_free_gb": round(free / (1024 ** 3), 2), "gpu": HAS_GPU}
 
 
 @app.post("/api/v1/inspect")
@@ -638,11 +685,43 @@ def inspect_resource(req: InspectRequest, _: bool = Depends(verify_key)):
     return scan_drive_recursive(resource_id, req.oauth_token, req.api_key)
 
 
+@app.get("/api/v1/jobs/active")
+def get_active_job(_: bool = Depends(verify_key)):
+    """Returns the most recent active or completed job so the tablet can auto-reconnect."""
+    with JOBS_LOCK:
+        if not ACTIVE_JOBS:
+            return {"has_active": False}
+        latest_job = list(ACTIVE_JOBS.values())[-1]
+        return {"has_active": True, "job": latest_job}
+
+
+@app.post("/api/v1/jobs/{job_id}/cancel")
+def cancel_job(job_id: str, _: bool = Depends(verify_key)):
+    CANCEL_FLAGS.add(job_id)
+    with JOBS_LOCK:
+        if job_id in ACTIVE_JOBS:
+            ACTIVE_JOBS[job_id]["state"] = "FAILED"
+            ACTIVE_JOBS[job_id]["current_file"] = "🛑 Cancelled by user."
+    return {"cancelled": True, "job_id": job_id}
+
+
+@app.post("/api/v1/jobs/cleanup")
+def cleanup_cloud_disk(_: bool = Depends(verify_key)):
+    for jid in list(ACTIVE_JOBS.keys()):
+        CANCEL_FLAGS.add(jid)
+    ACTIVE_JOBS.clear()
+    shutil.rmtree(WORK_DIR, ignore_errors=True)
+    WORK_DIR.mkdir(parents=True, exist_ok=True)
+    _, _, free = shutil.disk_usage(WORK_DIR)
+    return {"cleaned": True, "disk_free_gb": round(free / (1024 ** 3), 2)}
+
+
 @app.post("/api/v1/jobs/start")
 def start_job(req: StartJobRequest, _: bool = Depends(verify_key)):
     resource_id = extract_drive_id(req.drive_link)
     scan_data = scan_drive_recursive(resource_id, req.oauth_token, req.api_key)
     job_id = f"{resource_id}_{req.bulk_quality}"
+    CANCEL_FLAGS.discard(job_id)
 
     with JOBS_LOCK:
         if job_id in ACTIVE_JOBS and ACTIVE_JOBS[job_id]["state"] in ("CONVERTING", "PACKAGING_ZIP"):
@@ -663,7 +742,8 @@ def start_job(req: StartJobRequest, _: bool = Depends(verify_key)):
             "state": "STARTING",
             "processed_files": 0,
             "total_files": scan_data["total_files"],
-            "current_file": "Starting cloud download & FFmpeg pipeline...",
+            "overall_percent": 0.0,
+            "current_file": "Initializing cloud download & FFmpeg pipeline...",
             "estimated_total_bytes": est_total,
             "actual_bytes_so_far": 0,
             "file_results": [],
